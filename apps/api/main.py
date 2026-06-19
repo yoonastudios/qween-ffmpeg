@@ -49,12 +49,14 @@ ASSETS_DIR = Path(_assets_env) if _assets_env else Path(__file__).parent / "asse
 ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 ASSET_VIDEO_EXTS = {".mp4", ".mov", ".webm", ".avi", ".mkv"}
 ASSET_FONT_EXTS  = {".woff2", ".woff", ".ttf", ".otf"}
-ASSET_ALLOWED_EXTS = ASSET_VIDEO_EXTS | ASSET_FONT_EXTS
+ASSET_AUDIO_EXTS = {".mp3", ".wav", ".aac", ".ogg"}
+ASSET_ALLOWED_EXTS = ASSET_VIDEO_EXTS | ASSET_FONT_EXTS | ASSET_AUDIO_EXTS
 ASSET_MIME = {
     ".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm",
     ".avi": "video/x-msvideo", ".mkv": "video/x-matroska",
     ".woff2": "font/woff2", ".woff": "font/woff",
     ".ttf": "font/ttf", ".otf": "font/otf",
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".aac": "audio/aac", ".ogg": "audio/ogg",
 }
 _asset_hash_index: Dict[str, str] = {}  # content_hash -> asset_id
 _asset_lock = threading.Lock()
@@ -1262,6 +1264,99 @@ def _composite_video_layers(
     return comp_dir
 
 
+def build_audio_tracks(project: dict, asset_map: dict) -> list:
+    """Parse audioSlots + audio tweens from project.json into a list of track dicts.
+
+    Each track dict:
+      file            - absolute path to the audio asset on disk
+      trim_start      - atrim start (seconds)
+      trim_end        - atrim end (seconds)
+      timeline_offset - adelay value (seconds from master timeline start)
+      volume          - linear gain (0.0-2.0)
+    """
+    slots = project.get("audioSlots") or []
+    if not slots:
+        return []
+
+    slot_map = {s["_audioId"]: s for s in slots}
+
+    tweens_raw = project.get("tweens") or []
+    flat: list = []
+    for t in tweens_raw:
+        if t.get("isGroup") and t.get("children"):
+            flat.extend(t["children"])
+        else:
+            flat.append(t)
+
+    tracks = []
+    for t in flat:
+        cfg = t.get("_audioConfig")
+        if not cfg:
+            continue
+        audio_id = cfg.get("audioId")
+        slot = slot_map.get(audio_id)
+        if not slot:
+            continue
+
+        # Resolve asset file path via asset_map (keyed by filename stem/name)
+        asset_file = slot.get("_assetFile", "")
+        asset_filename = Path(asset_file).name
+        asset_stem     = Path(asset_file).stem
+        asset_id = asset_map.get(asset_filename) or asset_map.get(asset_stem)
+        if not asset_id:
+            continue  # blob not in ZIP - skip gracefully
+
+        # Asset is stored as ASSETS_DIR/{asset_id}/file{suffix}
+        suffix = Path(asset_filename).suffix.lower()
+        asset_path = ASSETS_DIR / asset_id / f"file{suffix}"
+        if not asset_path.exists():
+            continue
+
+        trim_start = float(cfg.get("fromTime", 0))
+        trim_end   = float(cfg.get("toTime", trim_start))
+        if trim_end <= trim_start:
+            continue
+
+        tracks.append({
+            "file":            str(asset_path),
+            "trim_start":      trim_start,
+            "trim_end":        trim_end,
+            "timeline_offset": float(t.get("position") or 0),
+            "volume":          float(cfg.get("volume", 1.0)),
+        })
+
+    return tracks
+
+
+def build_audio_filter_graph(tracks: list):
+    """Build an ffmpeg filter_complex string that trims, delays, and mixes all audio tracks.
+
+    Audio inputs are expected to be appended to the ffmpeg command starting at index 1
+    (index 0 is the PNG frame sequence). Returns None when there are no tracks.
+    """
+    if not tracks:
+        return None
+
+    filter_parts = []
+    labels = []
+    for i, tr in enumerate(tracks):
+        delay_ms = int(round(tr["timeline_offset"] * 1000))
+        filter_parts.append(
+            f"[{i + 1}:a]"
+            f"atrim=start={tr['trim_start']}:end={tr['trim_end']},"
+            f"asetpts=PTS-STARTPTS,"
+            f"volume={tr['volume']},"
+            f"adelay={delay_ms}|{delay_ms}"
+            f"[a{i}]"
+        )
+        labels.append(f"[a{i}]")
+
+    filter_parts.append(
+        f"{''.join(labels)}amix=inputs={len(tracks)}:normalize=0[aout]"
+    )
+    return "; ".join(filter_parts)
+
+
 def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
                             fps: float, crf: int, output_mode: str = "video"):
     import asyncio
@@ -1482,9 +1577,28 @@ def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
     if fmt == "gif":
         code, err = stitch_to_gif(input_pattern, fps, job_dir, output)
     else:
-        args = ["-framerate", str(fps), "-i", input_pattern, *cfg["codec_args"]]
-        if fmt in ("mp4", "mov"): args += ["-crf", str(crf), "-preset", "medium", "-g", str(int(fps * 2)), "-an"]
-        elif fmt == "webm":       args += ["-crf", str(crf), "-b:v", "0", "-an"]
+        # ── Audio: resolve tracks from payload and build filter graph ──────────
+        audio_tracks   = payload.get("_audio_tracks") or []
+        audio_inputs   = []
+        for tr in audio_tracks:
+            audio_inputs += ["-i", tr["file"]]
+        filter_graph = build_audio_filter_graph(audio_tracks)
+
+        args = ["-framerate", str(fps), "-i", input_pattern]
+        args += audio_inputs
+        args += cfg["codec_args"]
+        if filter_graph:
+            # Audio tracks present: inject filter_complex, map video + mixed audio
+            if fmt in ("mp4", "mov"):
+                args += ["-crf", str(crf), "-preset", "medium", "-g", str(int(fps * 2))]
+            elif fmt == "webm":
+                args += ["-crf", str(crf), "-b:v", "0"]
+            args += ["-filter_complex", filter_graph, "-map", "0:v", "-map", "[aout]",
+                     "-c:a", "aac" if fmt in ("mp4", "mov") else "libvorbis"]
+        else:
+            # No audio: same as before, suppress any accidental audio stream
+            if fmt in ("mp4", "mov"): args += ["-crf", str(crf), "-preset", "medium", "-g", str(int(fps * 2)), "-an"]
+            elif fmt == "webm":       args += ["-crf", str(crf), "-b:v", "0", "-an"]
         args += [str(output)]
         # Use real per-frame progress (84→99)
         code, _, err = run_ffmpeg_with_progress_queued(
@@ -1889,6 +2003,9 @@ async def render_project(
     # Attach the raw ZIP bytes so _run_playwright_render can save them to
     # apps/app/public/projects/{job_id}.zip for QweenRender.html to fetch
     payload["_project_zip"] = raw
+
+    # ── Attach audio tracks (Stage 2) ────────────────────────────────────────
+    payload["_audio_tracks"] = build_audio_tracks(project, asset_map)
 
     threading.Thread(
         target=_run_playwright_render_safe,
