@@ -49,14 +49,14 @@ ASSETS_DIR = Path(_assets_env) if _assets_env else Path(__file__).parent / "asse
 ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 ASSET_VIDEO_EXTS = {".mp4", ".mov", ".webm", ".avi", ".mkv"}
 ASSET_FONT_EXTS  = {".woff2", ".woff", ".ttf", ".otf"}
-ASSET_AUDIO_EXTS = {".mp3", ".wav", ".aac", ".ogg"}
+ASSET_AUDIO_EXTS = {".mp3", ".wav", ".aac", ".ogg", ".m4a"}
 ASSET_ALLOWED_EXTS = ASSET_VIDEO_EXTS | ASSET_FONT_EXTS | ASSET_AUDIO_EXTS
 ASSET_MIME = {
     ".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm",
     ".avi": "video/x-msvideo", ".mkv": "video/x-matroska",
     ".woff2": "font/woff2", ".woff": "font/woff",
     ".ttf": "font/ttf", ".otf": "font/otf",
-    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".aac": "audio/aac", ".ogg": "audio/ogg",
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".aac": "audio/aac", ".ogg": "audio/ogg", ".m4a": "audio/mp4",
 }
 _asset_hash_index: Dict[str, str] = {}  # content_hash -> asset_id
 _asset_lock = threading.Lock()
@@ -1282,9 +1282,16 @@ def build_audio_tracks(project: dict, asset_map: dict) -> list:
 
     tweens_raw = project.get("tweens") or []
     flat: list = []
+    def _flatten(tweens):
+        for t in tweens:
+            if t.get("isGroup") and t.get("children"):
+                yield from _flatten(t["children"])
+            else:
+                yield t
+
     for t in tweens_raw:
         if t.get("isGroup") and t.get("children"):
-            flat.extend(t["children"])
+            flat.extend(_flatten(t["children"]))
         else:
             flat.append(t)
 
