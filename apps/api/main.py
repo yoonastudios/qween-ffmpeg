@@ -567,7 +567,7 @@ async def merge_videos(
                                            "-movflags", "faststart", str(fixed)])
                 if code != 0:
                     code, _, err = run_ffmpeg_queued(["-i", str(raw), "-c:v", "libx264",
-                                               "-crf", "-preset", "fast",
+                                               "-crf", "18", "-preset", "fast",
                                                "-movflags", "faststart", str(fixed)])
                 if code != 0:
                     raise RuntimeError(f"Could not process clip {i+1}: {friendly_ffmpeg_error(err)}")
