@@ -1324,11 +1324,25 @@ def build_audio_tracks(project: dict, asset_map: dict) -> list:
         if trim_end <= trim_start:
             continue
 
+        # Client resolves GSAP's position syntax ('>', '<', '+=n', labels) at
+        # timeline-build time and sends the absolute root-timeline offset in
+        # seconds via _audioConfig._audioStartTime. Prefer that; only fall
+        # back to "position" (and only if it's actually numeric) for older
+        # project files saved before this field existed. Never let a raw
+        # GSAP position string (e.g. '>') reach float() and crash the request.
+        offset_raw = cfg.get("_audioStartTime")
+        if offset_raw is None:
+            offset_raw = t.get("position")
+        try:
+            timeline_offset = float(offset_raw) if offset_raw is not None else 0.0
+        except (TypeError, ValueError):
+            timeline_offset = 0.0
+
         tracks.append({
             "file":            str(asset_path),
             "trim_start":      trim_start,
             "trim_end":        trim_end,
-            "timeline_offset": float(t.get("position") or 0),
+            "timeline_offset": timeline_offset,
             "volume":          float(cfg.get("volume", 1.0)),
         })
 

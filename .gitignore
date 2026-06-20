@@ -17,6 +17,7 @@ env/
 # Playwright
 /apps/api/.playwright/
 
+
 # Generated / temp
 /apps/app/public/projects/*.zip
 *.mp4
@@ -32,6 +33,7 @@ Thumbbs.db
 .env.local
 .env.production
 apps/api/.env
+apps/api/assets/**
 apps/web/.env.local
 !**/.env.example
 
