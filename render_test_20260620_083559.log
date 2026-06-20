@@ -1,0 +1,35 @@
+── Log file: render_test_20260620_083559.log ──
+── Submitting video+audio.zip to http://localhost:8000/jobs/render-project ──
+Submit response:
+{"job_id":"7bcc6925-6473-42c0-84a5-52c538290647","status":"queued","poll_url":"/jobs/7bcc6925-6473-42c0-84a5-52c538290647/status","end_time":4.0,"stage":"1280×720","format":"mp4","fps":30.0}
+
+── Job ID: 7bcc6925-6473-42c0-84a5-52c538290647 — polling status every 2s ──
+
+[08:35:59] status=queued progress=0 message=Waiting in queue…
+[08:36:01] status=processing progress=3 message=Rendering frame 5/120 (2 bands)
+[08:36:03] status=processing progress=9 message=Rendering frame 16/120 (2 bands)
+[08:36:05] status=processing progress=15 message=Rendering frame 26/120 (2 bands)
+[08:36:07] status=processing progress=22 message=Rendering frame 37/120 (2 bands)
+[08:36:09] status=processing progress=28 message=Rendering frame 48/120 (2 bands)
+[08:36:11] status=processing progress=35 message=Rendering frame 59/120 (2 bands)
+[08:36:13] status=processing progress=42 message=Rendering frame 70/120 (2 bands)
+[08:36:15] status=processing progress=48 message=Rendering frame 81/120 (2 bands)
+[08:36:17] status=processing progress=55 message=Rendering frame 92/120 (2 bands)
+[08:36:19] status=processing progress=61 message=Rendering frame 102/120 (2 bands)
+[08:36:21] status=processing progress=67 message=Rendering frame 113/120 (2 bands)
+[08:36:24] status=processing progress=74 message=Compositing video layers…
+[08:36:26] status=processing progress=74 message=Compositing video layers…
+[08:36:28] status=error progress=0 message=Option not found
+
+── FAILED — full status JSON below, copy this entire block back ──
+{
+    "status": "error",
+    "message": "Option not found",
+    "progress": 0,
+    "label": "render-project \u2192 MP4",
+    "started_at": 1781944559.1557317,
+    "size_mb": null,
+    "format": null
+}
+
+── Full log saved to: render_test_20260620_083559.log — upload this file ──

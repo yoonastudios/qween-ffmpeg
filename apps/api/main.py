@@ -1264,15 +1264,96 @@ def _composite_video_layers(
     return comp_dir
 
 
+def _resolve_tween_positions(tweens: list) -> dict:
+    """Walk the flat tween list in order, resolving GSAP position syntax to
+    absolute seconds — mirroring how GSAP's timeline.add() works.
+
+    Supported:
+      numeric / "0" / "3.5"  → absolute start time
+      ">"                    → start after previous tween ends
+      ">+N" / ">-N"          → after previous end ± N seconds
+      "<"                    → same start as previous tween
+      "<+N" / "<-N"          → previous start ± N seconds
+      "-=N" / "+=N"          → relative to cursor (sequential end)
+      None / ""              → treated as ">" (GSAP default)
+
+    Returns dict of {tween_id_index: resolved_start_seconds}.
+    Keyed by list index to handle duplicate tween ids.
+    """
+    resolved: dict[int, float] = {}
+    prev_start = 0.0
+    prev_end   = 0.0
+
+    for i, t in enumerate(tweens):
+        tv       = t.get("timingVars") or {}
+        pos_raw  = t.get("position")
+        # Use timingVars.position if root position is empty/None
+        if not pos_raw and pos_raw != 0:
+            pos_raw = tv.get("position")
+
+        dur = float(tv.get("duration") or 0)
+        repeat       = int(tv.get("repeat") or 0)
+        repeat_delay = float(tv.get("repeatDelay") or 0)
+        total_dur    = dur * (repeat + 1) + repeat_delay * repeat
+
+        pos_str = str(pos_raw).strip() if pos_raw is not None else ""
+
+        if pos_str == "" or pos_str == ">":
+            start = prev_end
+        elif pos_str == "<":
+            start = prev_start
+        elif pos_str.startswith(">"):
+            offset_part = pos_str[1:]  # e.g. "+2" or "-1"
+            try:
+                start = prev_end + float(offset_part)
+            except ValueError:
+                start = prev_end
+        elif pos_str.startswith("<"):
+            offset_part = pos_str[1:]
+            try:
+                start = prev_start + float(offset_part)
+            except ValueError:
+                start = prev_start
+        elif pos_str.startswith("+="):
+            try:
+                start = prev_end + float(pos_str[2:])
+            except ValueError:
+                start = prev_end
+        elif pos_str.startswith("-="):
+            try:
+                start = max(0.0, prev_end - float(pos_str[2:]))
+            except ValueError:
+                start = prev_end
+        else:
+            try:
+                start = float(pos_str)
+            except ValueError:
+                start = prev_end  # unknown label → sequential
+
+        start = max(0.0, start)
+        resolved[i] = start
+        prev_start   = start
+        prev_end     = start + total_dur
+
+    return resolved
+
+
 def build_audio_tracks(project: dict, asset_map: dict) -> list:
     """Parse audioSlots + audio tweens from project.json into a list of track dicts.
 
     Each track dict:
       file            - absolute path to the audio asset on disk
-      trim_start      - atrim start (seconds)
-      trim_end        - atrim end (seconds)
-      timeline_offset - adelay value (seconds from master timeline start)
+      trim_start      - always 0.0 (audio plays from file start)
+      trim_end        - play_duration = toTime - fromTime seconds
+      timeline_offset - absolute seconds from master timeline start
       volume          - linear gain (0.0-2.0)
+
+    fromTime / toTime in _audioConfig are master-timeline positions defining
+    how long to play the clip, NOT seek offsets into the audio file.
+
+    GSAP relative positions (">" / "<" / ">+N" etc.) are resolved server-side
+    by _resolve_tween_positions() — never rely on _audioStartTime which
+    accumulates cumulative GSAP time and is unreliable.
     """
     slots = project.get("audioSlots") or []
     if not slots:
@@ -1295,8 +1376,11 @@ def build_audio_tracks(project: dict, asset_map: dict) -> list:
         else:
             flat.append(t)
 
+    # Resolve all tween positions up front (handles ">", "<", ">+N", etc.)
+    position_map = _resolve_tween_positions(flat)
+
     tracks = []
-    for t in flat:
+    for i, t in enumerate(flat):
         cfg = t.get("_audioConfig")
         if not cfg:
             continue
@@ -1319,29 +1403,20 @@ def build_audio_tracks(project: dict, asset_map: dict) -> list:
         if not asset_path.exists():
             continue
 
-        trim_start = float(cfg.get("fromTime", 0))
-        trim_end   = float(cfg.get("toTime", trim_start))
-        if trim_end <= trim_start:
+        # fromTime / toTime = master-timeline positions (NOT audio file offsets).
+        # Audio file always plays from its beginning for play_duration seconds.
+        from_time     = float(cfg.get("fromTime", 0))
+        to_time       = float(cfg.get("toTime", from_time))
+        if to_time <= from_time:
             continue
+        play_duration = to_time - from_time
 
-        # Client resolves GSAP's position syntax ('>', '<', '+=n', labels) at
-        # timeline-build time and sends the absolute root-timeline offset in
-        # seconds via _audioConfig._audioStartTime. Prefer that; only fall
-        # back to "position" (and only if it's actually numeric) for older
-        # project files saved before this field existed. Never let a raw
-        # GSAP position string (e.g. '>') reach float() and crash the request.
-        offset_raw = cfg.get("_audioStartTime")
-        if offset_raw is None:
-            offset_raw = t.get("position")
-        try:
-            timeline_offset = float(offset_raw) if offset_raw is not None else 0.0
-        except (TypeError, ValueError):
-            timeline_offset = 0.0
+        timeline_offset = position_map.get(i, 0.0)
 
         tracks.append({
             "file":            str(asset_path),
-            "trim_start":      trim_start,
-            "trim_end":        trim_end,
+            "trim_start":      0.0,
+            "trim_end":        play_duration,
             "timeline_offset": timeline_offset,
             "volume":          float(cfg.get("volume", 1.0)),
         })
@@ -1349,18 +1424,27 @@ def build_audio_tracks(project: dict, asset_map: dict) -> list:
     return tracks
 
 
-def build_audio_filter_graph(tracks: list):
+def build_audio_filter_graph(tracks: list, video_duration: float | None = None):
     """Build an ffmpeg filter_complex string that trims, delays, and mixes all audio tracks.
 
     Audio inputs are expected to be appended to the ffmpeg command starting at index 1
     (index 0 is the PNG frame sequence). Returns None when there are no tracks.
+
+    video_duration: if provided, tracks whose timeline_offset >= video_duration are dropped
+    (they would produce silence only and can cause duration inflation via adelay).
     """
     if not tracks:
         return None
 
+    active = tracks
+    if video_duration and video_duration > 0:
+        active = [tr for tr in tracks if tr["timeline_offset"] < video_duration]
+    if not active:
+        return None
+
     filter_parts = []
     labels = []
-    for i, tr in enumerate(tracks):
+    for i, tr in enumerate(active):
         delay_ms = int(round(tr["timeline_offset"] * 1000))
         filter_parts.append(
             f"[{i + 1}:a]"
@@ -1373,9 +1457,119 @@ def build_audio_filter_graph(tracks: list):
         labels.append(f"[a{i}]")
 
     filter_parts.append(
-        f"{''.join(labels)}amix=inputs={len(tracks)}:normalize=0[aout]"
+        f"{''.join(labels)}amix=inputs={len(active)}:normalize=0[aout]"
     )
     return "; ".join(filter_parts)
+
+
+def _composite_audio_layers(
+    job_id: str,
+    job_dir: Path,
+    tracks: list,
+    video_duration: float,
+) -> Path | None:
+    """
+    Composite audio layers into a single mixed WAV file, mirroring how
+    _composite_video_layers works for video.
+
+    Each track is:
+      file            - absolute path to the source audio asset
+      trim_start      - seconds into the source file to start (fromTime)
+      trim_end        - seconds into the source file to stop  (toTime)
+      timeline_offset - where on the master timeline this track starts (seconds)
+      volume          - linear gain (0.0-2.0)
+
+    Steps:
+      1. For each track: extract the trimmed clip into a temp WAV
+      2. Mix all temp WAVs together at their correct timeline offsets using
+         a single ffmpeg filter_complex (adelay + amix), output to mixed_audio.wav
+      3. Return path to mixed_audio.wav, or None if no valid tracks
+
+    The video duration is used to:
+      - Skip tracks whose timeline_offset >= video_duration (inaudible)
+      - Trim the final mix to exactly video_duration
+    """
+    if not tracks:
+        return None
+
+    # Drop tracks that start at or after the video ends — they contribute silence only
+    active = [tr for tr in tracks if tr["timeline_offset"] < video_duration]
+    if not active:
+        return None
+
+    clip_paths: list[Path] = []
+
+    # ── Step 1: extract each trimmed clip ────────────────────────────────────
+    for i, tr in enumerate(active):
+        clip_path = job_dir / f"audio_clip_{i}.wav"
+        dur = tr["trim_end"] - tr["trim_start"]
+        code, _, err = run_ffmpeg_queued([
+            "-ss", str(tr["trim_start"]),
+            "-t",  str(dur),
+            "-i",  tr["file"],
+            "-ac", "2",          # normalise to stereo
+            "-ar", "48000",      # normalise sample rate
+            "-af", f"volume={tr['volume']}",
+            str(clip_path),
+        ])
+        if code != 0:
+            # Skip broken clip rather than abort entire render
+            import logging
+            logging.warning("_composite_audio_layers: clip %d failed: %s", i, err)
+            continue
+        clip_paths.append((clip_path, tr["timeline_offset"]))
+
+    if not clip_paths:
+        return None
+
+    # ── Step 2: mix all clips at their timeline offsets ──────────────────────
+    mixed_path = job_dir / "mixed_audio.wav"
+    n = len(clip_paths)
+
+    if n == 1:
+        # Single track — apply delay then cap to video duration via -t
+        clip, offset = clip_paths[0]
+        delay_ms = int(round(offset * 1000))
+        args = ["-i", str(clip)]
+        if delay_ms > 0:
+            args += ["-af", f"adelay={delay_ms}|{delay_ms},asetpts=PTS-STARTPTS"]
+        args += ["-t", str(video_duration), str(mixed_path)]
+        code, _, err = run_ffmpeg_queued(args)
+    else:
+        inputs = []
+        for clip, _ in clip_paths:
+            inputs += ["-i", str(clip)]
+
+        filter_parts = []
+        labels = []
+        for i, (_, offset) in enumerate(clip_paths):
+            delay_ms = int(round(offset * 1000))
+            if delay_ms > 0:
+                filter_parts.append(f"[{i}:a]adelay={delay_ms}|{delay_ms},asetpts=PTS-STARTPTS[a{i}]")
+            else:
+                filter_parts.append(f"[{i}:a]anull[a{i}]")
+            labels.append(f"[a{i}]")
+
+        # amix: dropout_transition=0 is universally supported; normalize=0 is 4.4+
+        # Use duration=longest so delayed tracks aren't truncated, then cap with -t
+        filter_parts.append(
+            f"{''.join(labels)}amix=inputs={n}:duration=longest:dropout_transition=0[aout]"
+        )
+        filter_graph = "; ".join(filter_parts)
+
+        code, _, err = run_ffmpeg_queued(
+            inputs + [
+                "-filter_complex", filter_graph,
+                "-map", "[aout]",
+                "-t", str(video_duration),
+                str(mixed_path),
+            ]
+        )
+
+    if code != 0:
+        raise RuntimeError(f"Audio composite failed: {friendly_ffmpeg_error(err)}")
+
+    return mixed_path
 
 
 def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
@@ -1598,32 +1792,32 @@ def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
     if fmt == "gif":
         code, err = stitch_to_gif(input_pattern, fps, job_dir, output)
     else:
-        # ── Audio: resolve tracks from payload and build filter graph ──────────
+        # ── Audio: composite audio layers into a single mixed WAV ──────────────
         audio_tracks   = payload.get("_audio_tracks") or []
-        audio_inputs   = []
-        for tr in audio_tracks:
-            audio_inputs += ["-i", tr["file"]]
-        filter_graph = build_audio_filter_graph(audio_tracks)
+        video_duration = payload.get("endTime", 0) or 0
 
+        _job_update(job_id, status="processing", message="Compositing audio layers…", progress=85)
+        mixed_audio = _composite_audio_layers(job_id, job_dir, audio_tracks, video_duration)
+
+        # ── Stitch frames → video, mux mixed audio if present ─────────────────
         args = ["-framerate", str(fps), "-i", input_pattern]
-        args += audio_inputs
+        if mixed_audio:
+            args += ["-i", str(mixed_audio)]
         args += cfg["codec_args"]
-        if filter_graph:
-            # Audio tracks present: inject filter_complex, map video + mixed audio
-            if fmt in ("mp4", "mov"):
-                args += ["-crf", str(crf), "-preset", "medium", "-g", str(int(fps * 2))]
-            elif fmt == "webm":
-                args += ["-crf", str(crf), "-b:v", "0"]
-            args += ["-filter_complex", filter_graph, "-map", "0:v", "-map", "[aout]",
-                     "-c:a", "aac" if fmt in ("mp4", "mov") else "libvorbis"]
+        if fmt in ("mp4", "mov"):
+            args += ["-crf", str(crf), "-preset", "medium", "-g", str(int(fps * 2))]
+        elif fmt == "webm":
+            args += ["-crf", str(crf), "-b:v", "0"]
+        if mixed_audio:
+            args += ["-map", "0:v", "-map", "1:a",
+                     "-c:a", "aac" if fmt in ("mp4", "mov") else "libvorbis",
+                     "-shortest"]
         else:
-            # No audio: same as before, suppress any accidental audio stream
-            if fmt in ("mp4", "mov"): args += ["-crf", str(crf), "-preset", "medium", "-g", str(int(fps * 2)), "-an"]
-            elif fmt == "webm":       args += ["-crf", str(crf), "-b:v", "0", "-an"]
+            args += ["-an"]
         args += [str(output)]
-        # Use real per-frame progress (84→99)
+        # Use real per-frame progress (87→99)
         code, _, err = run_ffmpeg_with_progress_queued(
-            args, job_id, total_frames, progress_start=84, progress_end=99
+            args, job_id, total_frames, progress_start=87, progress_end=99
         )
 
     if code != 0:
