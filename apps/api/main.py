@@ -100,6 +100,16 @@ def _mark_output(job_id: str, fmt: str, size_mb: float):
 # ── #7 — CPU Queue (semaphore, max 1 concurrent ffmpeg job) ───────────────────
 _ffmpeg_sem = threading.Semaphore(1)
 
+# ── Stage 1.2 — global cap on concurrent Playwright-render workers ────────────
+# Each "worker" here is one (Chromium page + its own ffmpeg encode subprocess)
+# pair used by the parallel frame-range renderer below. This is a separate
+# pool from _ffmpeg_sem (which guards short single-shot ffmpeg calls like
+# merges/segments) — unifying every CPU-bound code path into one scheduler is
+# a larger change, flagged for later. Default cap leaves 1 core free for the
+# FastAPI process itself on the 4-CPU target server; override via env var.
+MAX_GLOBAL_RENDER_WORKERS = int(os.environ.get("MAX_RENDER_WORKERS", str(max(1, (os.cpu_count() or 4) - 1))))
+_render_worker_sem = threading.Semaphore(MAX_GLOBAL_RENDER_WORKERS)
+
 # ── #8 — Async job status store ───────────────────────────────────────────────
 _async_jobs: Dict[str, Dict[str, Any]] = {}
 _async_lock = threading.Lock()
@@ -1015,6 +1025,7 @@ class PlaywrightRenderRequest(BaseModel):
     swapTemplates: List[Dict[str, Any]] = []
     storedInitialStates: List[Dict[str, Any]] = []
     gsapCdn: Optional[str] = None
+    workers: int = 1  # Stage 1.2: parallel frame-range workers (capped server-side)
 
 
 # /render-stage removed — Playwright now loads QweenRender.html directly
@@ -1635,6 +1646,18 @@ def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
     use_jpeg_frames = (not has_video_nodes) and output_mode != "png_sequence"
     frame_ext = ".jpg" if use_jpeg_frames else ".png"
 
+    # ── Stage 1.2/1.3: parallel frame-range workers + stdin streaming ──────────
+    # Only for the simple (no video-node compositing) path producing a real
+    # video output — gif keeps the original palette-based two-pass flow, and
+    # png_sequence needs literal frame files on disk either way.
+    stream_simple_path = use_jpeg_frames and fmt != "gif"
+    requested_workers = int(payload.get("workers") or 1)
+    job_workers = max(1, min(
+        requested_workers,
+        MAX_GLOBAL_RENDER_WORKERS,
+        total_frames,  # no point in more workers than frames
+    )) if stream_simple_path else 1
+
     # One transparent SVG "band" per gap between (and around) the stacked
     # video nodes — len(video_zs) + 1 bands total. With a single video this
     # is just the old below/above pair; with N videos it generalizes to N+1
@@ -1647,7 +1670,9 @@ def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
             band_dir.mkdir(exist_ok=True)
             frames_band_dirs.append(band_dir)
 
-    async def _render():
+    seg_paths: list[Path] = []  # filled by the streamed-worker path, used post-render
+
+    def _build_project_zip_and_url() -> str:
         # Rebuild the project ZIP from the already-remapped payload so QweenRender
         # receives _videoSlots[].src rather than the original unremapped project.json.
         # Also re-embed any assets/ blobs that were in the original ZIP so the
@@ -1658,7 +1683,6 @@ def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
             _zf.writestr("project.json", json.dumps({
                 k: v for k, v in payload.items() if k != "_project_zip"
             }))
-            # Re-embed assets/ blobs from the original ZIP if present
             _orig_zip_bytes = payload.get("_project_zip")
             if _orig_zip_bytes:
                 try:
@@ -1671,11 +1695,108 @@ def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
                     pass
         project_zip_path = PROJECTS_DIR / f"{job_id}.zip"
         project_zip_path.write_bytes(zip_buf.getvalue())
-
-        render_url = (
+        return (
             f"{RENDERER_URL}/QweenRender.html"
             f"?src={RENDERER_URL}/projects/{job_id}.zip"
         )
+
+    async def _render_worker_range(worker_idx: int, start_i: int, end_i: int,
+                                    render_url: str, seg_path: Path,
+                                    frames_done: list[int]):
+        """Stage 1.2/1.3: render frames [start_i, end_i) in its own browser
+        page, streaming JPEG screenshots directly into its own ffmpeg encode
+        subprocess via stdin — no frame files ever touch disk."""
+        cfg = FORMAT_CONFIG[fmt]
+        seg_args = ["-f", "image2pipe", "-vcodec", "mjpeg",
+                    "-framerate", str(fps), "-i", "-", *cfg["codec_args"]]
+        if fmt in ("mp4", "mov"):
+            seg_args += ["-crf", str(crf), "-preset", "medium", "-g", str(int(fps * 2))]
+        elif fmt == "webm":
+            seg_args += ["-crf", str(crf), "-b:v", "0"]
+        seg_args += ["-an", str(seg_path)]
+
+        # threading.Semaphore.acquire() blocks the calling thread — running it
+        # directly would stall this entire event loop (and every other worker
+        # awaiting on it). Offload the blocking wait to the default executor.
+        await asyncio.get_running_loop().run_in_executor(None, _render_worker_sem.acquire)
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(args=[
+                    "--autoplay-policy=no-user-gesture-required",
+                    "--disable-web-security",
+                ])
+                try:
+                    ffmpeg_proc = await asyncio.create_subprocess_exec(
+                        FFMPEG_BIN, "-y", *seg_args,
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    try:
+                        page = await browser.new_page(viewport={"width": stage_w, "height": stage_h})
+                        await page.goto(render_url, wait_until="networkidle", timeout=60_000)
+                        await page.wait_for_function("window.__qween_ready === true", timeout=120_000)
+                        await page.evaluate(
+                            "(mode) => window.__qween_set_layer_mode && window.__qween_set_layer_mode(mode, null, null)",
+                            "normal",
+                        )
+                        for i in range(start_i, end_i):
+                            t = start_time + (i / fps)
+                            await page.evaluate("async (t) => { await window.__qween_seek(t); }", t)
+                            await page.wait_for_function("window.__qween_frame_ready === true", timeout=30_000)
+                            jpeg_bytes = await page.screenshot(
+                                type="jpeg", quality=90,
+                                clip={"x": 0, "y": 0, "width": stage_w, "height": stage_h},
+                            )
+                            ffmpeg_proc.stdin.write(jpeg_bytes)
+                            await ffmpeg_proc.stdin.drain()
+                            frames_done[worker_idx] += 1
+                            done = sum(frames_done)
+                            _job_update(job_id, progress=int(done / total_frames * 72),
+                                         message=f"Rendering frame {done}/{total_frames} ({job_workers} worker{'s' if job_workers != 1 else ''})")
+                    finally:
+                        if ffmpeg_proc.stdin and not ffmpeg_proc.stdin.is_closing():
+                            ffmpeg_proc.stdin.close()
+                        _, seg_err = await ffmpeg_proc.communicate()
+                        if ffmpeg_proc.returncode != 0:
+                            raise RuntimeError(
+                                f"Worker {worker_idx} segment encode failed: "
+                                f"{friendly_ffmpeg_error(seg_err.decode(errors='ignore'))}"
+                            )
+                finally:
+                    await browser.close()
+        finally:
+            _render_worker_sem.release()
+
+    async def _render_streamed_simple(render_url: str):
+        ranges: list[tuple[int, int]] = []
+        base = total_frames // job_workers
+        extra = total_frames % job_workers
+        cursor = 0
+        for w in range(job_workers):
+            size = base + (1 if w < extra else 0)
+            ranges.append((cursor, cursor + size))
+            cursor += size
+
+        frames_done = [0] * job_workers
+        for w in range(job_workers):
+            seg_paths.append(job_dir / f"_seg_{w:02d}{FORMAT_CONFIG[fmt]['ext']}")
+
+        await asyncio.gather(*[
+            _render_worker_range(w, ranges[w][0], ranges[w][1], render_url, seg_paths[w], frames_done)
+            for w in range(job_workers)
+        ])
+
+    async def _render():
+        render_url = _build_project_zip_and_url()
+        project_zip_path = PROJECTS_DIR / f"{job_id}.zip"
+
+        if stream_simple_path:
+            try:
+                await _render_streamed_simple(render_url)
+            finally:
+                project_zip_path.unlink(missing_ok=True)
+            return
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(args=[
@@ -1774,6 +1895,61 @@ def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
                 project_zip_path.unlink(missing_ok=True)
 
     asyncio.run(_render())
+
+    if stream_simple_path:
+        # ── Stage 1.2/1.3: segments were streamed straight from Playwright into
+        # per-worker ffmpeg encodes — concat them (lossless stream copy, same
+        # codec/crf across all segments) instead of compositing/stitching a
+        # frame-file sequence that was never written to disk.
+        _job_update(job_id, status="processing", message="Concatenating render segments…", progress=76)
+        output = output_path_for(job_dir, fmt)
+        cfg = FORMAT_CONFIG[fmt]
+
+        if len(seg_paths) == 1:
+            concat_video = seg_paths[0]
+        else:
+            concat_list = job_dir / "_concat_list.txt"
+            concat_list.write_text("\n".join(f"file '{p.name}'" for p in seg_paths))
+            concat_video = job_dir / f"_concat{cfg['ext']}"
+            code, _, err = run_ffmpeg_queued(
+                ["-f", "concat", "-safe", "0", "-i", str(concat_list), "-c", "copy", str(concat_video)],
+                cwd=job_dir,
+            )
+            if code != 0:
+                raise RuntimeError(f"Segment concat failed: {friendly_ffmpeg_error(err)}")
+
+        audio_tracks   = payload.get("_audio_tracks") or []
+        video_duration = payload.get("endTime", 0) or 0
+        _job_update(job_id, status="processing", message="Compositing audio layers…", progress=85)
+        mixed_audio = _composite_audio_layers(job_id, job_dir, audio_tracks, video_duration)
+
+        args = ["-i", str(concat_video)]
+        if mixed_audio:
+            args += ["-i", str(mixed_audio)]
+        args += ["-c:v", "copy"]
+        if mixed_audio:
+            args += ["-map", "0:v", "-map", "1:a",
+                     "-c:a", "aac" if fmt in ("mp4", "mov") else "libvorbis",
+                     "-shortest"]
+        else:
+            args += ["-an"]
+        args += [str(output)]
+        code, _, err = run_ffmpeg_with_progress_queued(
+            args, job_id, total_frames, progress_start=87, progress_end=99
+        )
+        if code != 0:
+            raise RuntimeError(friendly_ffmpeg_error(err))
+
+        for p in seg_paths:
+            p.unlink(missing_ok=True)
+        if len(seg_paths) > 1:
+            concat_video.unlink(missing_ok=True)
+            concat_list.unlink(missing_ok=True)
+
+        mb = round(output.stat().st_size / 1_048_576, 2)
+        _mark_output(job_id, fmt, mb)
+        _job_update(job_id, status="done", message=f"Done — {mb} MB", progress=100, size_mb=mb, format=fmt)
+        return
 
     # ── Option-B: composite video layers with correct z-ordering ──────────────
     # N-band composite: [band 0] → [video 0's clips] → [band 1] → [video 1's
@@ -2145,6 +2321,7 @@ async def render_project(
     end_time:     float = Form(0),
     stage_width:  int   = Form(0),
     stage_height: int   = Form(0),
+    workers:      int   = Form(1),  # Stage 1.2: parallel frame-range workers
 ):
     """Accept a QweenApp project ZIP (or bare project.json) and render it to video.
 
@@ -2243,6 +2420,7 @@ async def render_project(
     # Attach the raw ZIP bytes so _run_playwright_render can save them to
     # apps/app/public/projects/{job_id}.zip for QweenRender.html to fetch
     payload["_project_zip"] = raw
+    payload["workers"] = workers
 
     # ── Attach audio tracks (Stage 2) ────────────────────────────────────────
     payload["_audio_tracks"] = build_audio_tracks(project, asset_map)
