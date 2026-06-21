@@ -1625,6 +1625,16 @@ def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
     video_zs       = [e["z"] for e in video_node_entries]
     has_video_nodes = bool(video_node_entries)
 
+    # ── Stage 1.4: JPEG frames for the simple (no-alpha) path ──────────────────
+    # When there are no video nodes, there's no banded alpha-compositing pass —
+    # each frame is fully opaque, so PNG's lossless alpha channel buys nothing
+    # and just costs disk space + I/O time. Switch to JPEG in that case, unless
+    # the caller explicitly wants a PNG sequence as the output (output_mode ==
+    # "png_sequence"), where the deliverable itself is PNG frames and must stay
+    # lossless/alpha-capable.
+    use_jpeg_frames = (not has_video_nodes) and output_mode != "png_sequence"
+    frame_ext = ".jpg" if use_jpeg_frames else ".png"
+
     # One transparent SVG "band" per gap between (and around) the stacked
     # video nodes — len(video_zs) + 1 bands total. With a single video this
     # is just the old below/above pair; with N videos it generalizes to N+1
@@ -1713,10 +1723,14 @@ def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
                         t = start_time + (i / fps)
                         await page.evaluate("async (t) => { await window.__qween_seek(t); }", t)
                         await page.wait_for_function("window.__qween_frame_ready === true", timeout=30_000)
-                        await page.screenshot(
-                            path=str(frames_dir / f"frame_{i:06d}.png"),
+                        shot_kwargs: dict[str, Any] = dict(
+                            path=str(frames_dir / f"frame_{i:06d}{frame_ext}"),
                             clip={"x": 0, "y": 0, "width": stage_w, "height": stage_h},
                         )
+                        if use_jpeg_frames:
+                            shot_kwargs["type"] = "jpeg"
+                            shot_kwargs["quality"] = 90
+                        await page.screenshot(**shot_kwargs)
                         _job_update(job_id, progress=int((i + 1) / total_frames * 72),
                                      message=f"Rendering frame {i+1}/{total_frames}")
                 else:
@@ -1777,7 +1791,7 @@ def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
         # ── PNG Sequence export: zip stitch_dir and store as output.zip ────────
         _job_update(job_id, status="processing", message="Packaging PNG sequence…", progress=84)
         output_zip = job_dir / "output.zip"
-        frames = sorted(stitch_dir.glob("frame_*.png"))
+        frames = sorted(stitch_dir.glob(f"frame_*{frame_ext}"))
         with zipfile.ZipFile(output_zip, "w", zipfile.ZIP_STORED) as zf:
             for i, f in enumerate(frames):
                 zf.write(f, f.name)
@@ -1799,7 +1813,7 @@ def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
 
     output = output_path_for(job_dir, fmt)
     cfg = FORMAT_CONFIG[fmt]
-    input_pattern = str(stitch_dir / "frame_%06d.png")
+    input_pattern = str(stitch_dir / f"frame_%06d{frame_ext}")
     if fmt == "gif":
         code, err = stitch_to_gif(input_pattern, fps, job_dir, output)
     else:
