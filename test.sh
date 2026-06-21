@@ -195,9 +195,9 @@ if [ -z "$ONLY" ] || [ "$ONLY" = "api" ]; then
   else
     assert_json_field "health" "$R" "status" "ok"
     assert_json_exists "health" "$R" "ffmpeg"
-    assert_json_exists "health" "$R" "version"
+    assert_json_exists "health" "$R" "ffmpeg_bin"
     info "FFmpeg  : $(jf "$R" "ffmpeg")"
-    info "Version : $(jf "$R" "version")"
+    info "Binary  : $(jf "$R" "ffmpeg_bin")"
     info "Storage : $(jf "$R" "storage_used_mb") MB"
     info "Jobs    : $(jf "$R" "active_jobs") active"
   fi

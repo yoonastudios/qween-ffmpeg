@@ -2,8 +2,8 @@
   // These tasks will run in order when initializing your CodeSandbox project.
   "setupTasks": [
     {
-      "command": "sudo apt-get update -qq && sudo apt-get install -y ffmpeg",
-      "name": "Install ffmpeg"
+      "command": "sudo bash scripts/install_ffmpeg.sh",
+      "name": "Install ffmpeg (pinned 7.1 static build)"
     },
     {
       "command": "npm install -g pnpm@9.1.0",

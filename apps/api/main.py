@@ -29,6 +29,17 @@ MAX_ZIP_MB       = 500
 MAX_VIDEO_MB     = 2048
 AUTO_CLEAN_HOURS = 6
 
+# ── ffmpeg/ffprobe binary pin ────────────────────────────────────────────────
+# Default to a pinned static build at this path (see scripts/install_ffmpeg.sh)
+# instead of relying on whatever apt happened to install on the host. Override
+# with FFMPEG_BIN/FFPROBE_BIN env vars if your deploy target installs ffmpeg
+# elsewhere. Falls back to bare "ffmpeg"/"ffprobe" on $PATH only if the pinned
+# binary isn't present, so local dev without the pinned build still works.
+_pinned_ffmpeg  = Path(os.environ.get("FFMPEG_DIR", "/opt/ffmpeg-pinned")) / "ffmpeg"
+_pinned_ffprobe = Path(os.environ.get("FFMPEG_DIR", "/opt/ffmpeg-pinned")) / "ffprobe"
+FFMPEG_BIN  = os.environ.get("FFMPEG_BIN")  or (str(_pinned_ffmpeg)  if _pinned_ffmpeg.is_file()  else "ffmpeg")
+FFPROBE_BIN = os.environ.get("FFPROBE_BIN") or (str(_pinned_ffprobe) if _pinned_ffprobe.is_file() else "ffprobe")
+
 # ── Format config ─────────────────────────────────────────────────────────────
 FORMAT_CONFIG = {
     "mp4":  {"ext": ".mp4",  "mime": "video/mp4",      "codec_args": ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-tune", "animation", "-movflags", "+faststart"]},
@@ -152,7 +163,7 @@ def new_job(label: str = "", input_file: str = "") -> tuple[str, Path]:
     return job_id, job_dir
 
 def run_ffmpeg(args: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
-    result = subprocess.run(["ffmpeg", "-y", *args], capture_output=True, text=True,
+    result = subprocess.run([FFMPEG_BIN, "-y", *args], capture_output=True, text=True,
                             cwd=str(cwd) if cwd else None)
     return result.returncode, result.stdout, result.stderr
 
@@ -166,7 +177,7 @@ def run_ffmpeg_with_progress(args: list[str], job_id: str,
                               progress_start: int = 0, progress_end: int = 100,
                               cwd: Path | None = None) -> tuple[int, str, str]:
     """Run ffmpeg with real per-frame progress updates via -progress pipe:1."""
-    full_args = ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats", *args]
+    full_args = [FFMPEG_BIN, "-y", "-progress", "pipe:1", "-nostats", *args]
     proc = subprocess.Popen(
         full_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, cwd=str(cwd) if cwd else None,
@@ -210,7 +221,7 @@ def natural_sort_key(s: str):
 
 def probe_video(path: Path) -> dict:
     r = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+        [FFPROBE_BIN, "-v", "error", "-select_streams", "v:0",
          "-show_entries", "stream=width,height,duration", "-of", "csv=p=0", str(path)],
         capture_output=True, text=True,
     )
@@ -294,11 +305,11 @@ def to_float(v):
 # ── Health ────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
-    r    = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True)
+    r    = subprocess.run([FFMPEG_BIN, "-version"], capture_output=True, text=True)
     line = r.stdout.splitlines()[0] if r.stdout else "unknown"
     total_mb = sum(f.stat().st_size for f in WORK_DIR.rglob("*") if f.is_file()) / 1_048_576
     queue_busy = not _ffmpeg_sem._value  # 0 = busy, 1 = free
-    return {"status": "ok", "ffmpeg": line, "version": "4.0.0",
+    return {"status": "ok", "ffmpeg": line, "ffmpeg_bin": FFMPEG_BIN,
             "active_jobs": len(list(WORK_DIR.iterdir())),
             "storage_used_mb": round(total_mb, 1),
             "queue_busy": queue_busy,
@@ -342,7 +353,7 @@ async def upload_frames(file: UploadFile = File(...)):
     for i, img in enumerate(all_images):
         shutil.copy(img, flat_dir / f"frame_{i:06d}{img_ext}")
     probe = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+        [FFPROBE_BIN, "-v", "error", "-select_streams", "v:0",
          "-show_entries", "stream=width,height", "-of", "csv=p=0",
          str(flat_dir / f"frame_000000{img_ext}")],
         capture_output=True, text=True)
