@@ -1304,7 +1304,7 @@ def _composite_video_layers(
     comp_args = (
         ffmpeg_inputs
         + ["-filter_complex", filter_complex, "-map", f"[{final_label}]"]
-        + ["-vsync", "0"]
+        + ["-fps_mode", "passthrough"]  # was: -vsync 0 (deprecated since ffmpeg 5.0)
         + [str(comp_dir / "frame_%06d.png")]
     )
     code, _, err = run_ffmpeg_queued(comp_args)
