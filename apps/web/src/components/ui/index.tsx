@@ -263,6 +263,59 @@ export function UploadProgress({ pct, label = 'Uploading…' }: { pct: number; l
   )
 }
 
+// ── ResultPreview ──────────────────────────────────────────────────────────────
+// Stage 2.1: lets people watch the output before deciding to download it or
+// chain it into another tool, instead of a download-only link.
+export type SendToOption = { id: string; label: string }
+export function ResultPreview({
+  jobId, mb, fmt, apiBase, label = 'Output ready', sendToOptions, onSendTo, onReset,
+}: {
+  jobId: string; mb: number | null; fmt: string; apiBase: string; label?: string
+  sendToOptions?: SendToOption[]
+  onSendTo?: (toolId: string) => void
+  onReset: () => void
+}) {
+  const formatLabel = (f: string) => ({ mp4: 'MP4', mov: 'MOV', webm: 'WebM', gif: 'GIF' }[f] ?? f.toUpperCase())
+  return (
+    <Card className="overflow-hidden">
+      <video
+        src={`${apiBase}/jobs/${jobId}/download`}
+        controls
+        playsInline
+        className="w-full bg-black block"
+        style={{ maxHeight: 360 }}
+      />
+      <div className="p-4 flex flex-col gap-3">
+        <div className="flex items-center gap-2">
+          <div className="w-2 h-2 rounded-full bg-green animate-pulse flex-shrink-0" />
+          <span className="text-sm font-semibold text-text">
+            {label} · {mb ?? '—'} MB · {formatLabel(fmt)}
+          </span>
+        </div>
+
+        <DownloadBtn href={`${apiBase}/jobs/${jobId}/download`} label={`Download ${formatLabel(fmt)}`} />
+
+        {sendToOptions && sendToOptions.length > 0 && (
+          <div className="flex flex-col gap-2">
+            <SectionTitle>Send to</SectionTitle>
+            <div className="flex gap-2 flex-wrap">
+              {sendToOptions.map(opt => (
+                <button key={opt.id} onClick={() => onSendTo?.(opt.id)}
+                  className="px-3 py-2 rounded-lg text-xs font-mono border border-border bg-bg
+                    text-sub hover:border-accent/50 hover:text-text transition-colors select-none">
+                  → {opt.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <Btn onClick={onReset} variant="ghost" fullWidth>Start Over</Btn>
+      </div>
+    </Card>
+  )
+}
+
 // ── StorageBadge ──────────────────────────────────────────────────────────────
 export function StorageBadge({ mb, onClean }: { mb: number; onClean: () => void }) {
   const color = mb > 400 ? 'text-red' : mb > 200 ? 'text-amber-400' : 'text-muted'

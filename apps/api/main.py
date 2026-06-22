@@ -403,6 +403,36 @@ async def upload_video(file: UploadFile = File(...)):
     return {"job_id": job_id, "width": info["width"], "height": info["height"],
             "duration": info["duration"], "size_mb": round(size_mb, 1)}
 
+# ── Stage 2.1: chain a finished job's output as the next tool's input ─────────
+# Lets the "Send to [tool]" preview action reuse a completed job's output
+# without the browser downloading and re-uploading the file — just a
+# server-side copy into a fresh job dir, same response shape as upload-video
+# so the frontend can treat it identically to a fresh upload.
+@app.post("/jobs/{job_id}/use-as-source")
+def use_as_source(job_id: str):
+    src_dir = WORK_DIR / job_id
+    if not src_dir.exists():
+        raise HTTPException(404, "Source job not found.")
+    with _meta_lock:
+        meta = _job_meta.get(job_id)
+    if not meta or not meta.get("has_output"):
+        raise HTTPException(409, "Source job has no finished output yet.")
+    fmt = meta.get("format") or "mp4"
+    if fmt == "png_sequence":
+        raise HTTPException(400, "Cannot use a PNG sequence output as a video source.")
+    src_path = output_path_for(src_dir, fmt)
+    if not src_path.exists():
+        raise HTTPException(404, "Source output file is missing on disk.")
+
+    new_id, new_dir = new_job(label=f"from {job_id[:8]}", input_file=src_path.name)
+    suffix = FORMAT_CONFIG[fmt]["ext"]
+    video_path = new_dir / f"input{suffix}"
+    shutil.copyfile(src_path, video_path)
+    info = probe_video(video_path)
+    size_mb = round(video_path.stat().st_size / 1_048_576, 1)
+    return {"job_id": new_id, "width": info["width"], "height": info["height"],
+            "duration": info["duration"], "size_mb": size_mb}
+
 # ── Frame preview ─────────────────────────────────────────────────────────────
 @app.get("/jobs/{job_id}/frame/{index}")
 def get_frame(job_id: str, index: int):

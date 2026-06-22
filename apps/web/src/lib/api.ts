@@ -160,6 +160,7 @@ export interface RenderProjectParams {
   fps: number; crf: number; format: VideoFormat
   start_time?: number; end_time?: number
   stage_width?: number; stage_height?: number
+  workers?: number
 }
 export interface RenderProjectResult {
   job_id: string; status: string; poll_url: string
@@ -188,6 +189,13 @@ export async function cleanAllJobs(base = DEFAULT_BASE): Promise<{ deleted_jobs:
 
 export async function deleteJob(jobId: string, base = DEFAULT_BASE) {
   await fetch(`${base}/jobs/${jobId}`, { method: 'DELETE' })
+}
+
+// ── Stage 2.1: chain a finished job's output into a new job as input ─────────
+// Server-side copy, no re-upload — frontend treats the result identically to
+// a fresh uploadVideo() response.
+export async function useAsSource(jobId: string, base = DEFAULT_BASE): Promise<VideoUploadResult> {
+  return apiFetch(`${base}/jobs/${jobId}/use-as-source`, { method: 'POST' }, 'Could not send job to next tool')
 }
 
 // ── URLs ──────────────────────────────────────────────────────────────────────

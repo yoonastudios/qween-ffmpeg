@@ -1,14 +1,17 @@
 'use client'
 import { useState, useRef } from 'react'
 import { DropZone, Btn, Card, Field, NumInput, PillGroup, SectionTitle,
-         LogBox, ErrorBox, DownloadBtn, UploadProgress } from '@/components/ui'
-import { renderProject, downloadUrl, VIDEO_FORMATS, FORMAT_LABELS } from '@/lib/api'
+         LogBox, ErrorBox, ResultPreview, UploadProgress } from '@/components/ui'
+import { renderProject, VIDEO_FORMATS } from '@/lib/api'
 import type { VideoFormat } from '@/lib/api'
 
 const FPS_OPTIONS = [12, 24, 25, 30, 48, 60]
 type Stage = 'idle' | 'ready' | 'uploading' | 'queued' | 'processing' | 'done' | 'error'
 
-export default function RenderTool({ apiBase }: { apiBase: string }) {
+export default function RenderTool({ apiBase, onChainTo }: {
+  apiBase: string
+  onChainTo?: (jobId: string, toolId: string) => void
+}) {
   const [file, setFile]       = useState<File | null>(null)
   const [stage, setStage]     = useState<Stage>('idle')
   const [jobId, setJobId]     = useState<string | null>(null)
@@ -27,6 +30,7 @@ export default function RenderTool({ apiBase }: { apiBase: string }) {
   const [endTime, setEndTime]     = useState('')
   const [stageW, setStageW] = useState('')
   const [stageH, setStageH] = useState('')
+  const [workers, setWorkers] = useState(1)
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const addLog = (m: string) => setLog(p => [...p, m])
@@ -63,7 +67,7 @@ export default function RenderTool({ apiBase }: { apiBase: string }) {
     setStage('uploading'); setError(''); setLog([]); setUploadPct(0); setProgress(0); setMessage('')
     addLog(`Uploading ${file.name}…`)
     try {
-      const params: any = { fps, crf, format }
+      const params: any = { fps, crf, format, workers }
       if (startTime) params.start_time   = Number(startTime)
       if (endTime)   params.end_time     = Number(endTime)
       if (stageW)    params.stage_width  = Number(stageW)
@@ -109,6 +113,15 @@ export default function RenderTool({ apiBase }: { apiBase: string }) {
           <div>
             <SectionTitle>Frame Rate</SectionTitle>
             <PillGroup options={FPS_OPTIONS} value={fps} onChange={v => setFps(Number(v))} />
+          </div>
+          <div>
+            <SectionTitle>Render Workers</SectionTitle>
+            <PillGroup options={[1, 2, 3]} value={workers} onChange={v => setWorkers(Number(v))} />
+            <p className="text-[11px] text-muted font-mono mt-2">
+              {workers === 1
+                ? 'Single browser/encoder pass.'
+                : `Splits the timeline across ${workers} parallel renderers — faster for longer animations, ignored if the project uses video layers.`}
+            </p>
           </div>
           <Field label={`Quality — CRF ${crf}`} hint={crf <= 18 ? '✦ visually lossless' : crf <= 28 ? '✦ good' : '⚠ lossy'}>
             <div className="flex items-center gap-3">
@@ -160,17 +173,12 @@ export default function RenderTool({ apiBase }: { apiBase: string }) {
       <ErrorBox message={error} />
 
       {stage === 'done' && jobId && (
-        <Card className="p-4 flex flex-col gap-3">
-          <div className="flex items-center gap-2">
-            <div className="w-2 h-2 rounded-full bg-green animate-pulse" />
-            <span className="text-sm font-semibold text-text">
-              Output ready · {resultMb} MB · {FORMAT_LABELS[resultFmt] ?? resultFmt.toUpperCase()}
-            </span>
-          </div>
-          <DownloadBtn href={downloadUrl(jobId, apiBase)}
-            label={`Download ${FORMAT_LABELS[resultFmt] ?? resultFmt.toUpperCase()}`} />
-          <Btn onClick={reset} variant="ghost" fullWidth>Start Over</Btn>
-        </Card>
+        <ResultPreview
+          jobId={jobId} mb={resultMb} fmt={resultFmt} apiBase={apiBase}
+          sendToOptions={[{ id: 'crop', label: 'Crop' }, { id: 'trim', label: 'Trim' }]}
+          onSendTo={toolId => onChainTo?.(jobId, toolId)}
+          onReset={reset}
+        />
       )}
 
       {(stage === 'ready' || stage === 'error') && (

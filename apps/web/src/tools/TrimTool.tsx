@@ -1,13 +1,18 @@
 'use client'
-import { useState, useRef } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import { DropZone, Btn, Card, Field, NumInput, SectionTitle,
-         LogBox, ErrorBox, DownloadBtn, PillGroup, UploadProgress } from '@/components/ui'
-import { uploadVideo, downloadUrl, VIDEO_FORMATS, FORMAT_LABELS } from '@/lib/api'
-import type { VideoFormat } from '@/lib/api'
+         LogBox, ErrorBox, ResultPreview, PillGroup, UploadProgress } from '@/components/ui'
+import { uploadVideo, VIDEO_FORMATS } from '@/lib/api'
+import type { VideoFormat, VideoUploadResult } from '@/lib/api'
 
 type Stage = 'idle' | 'uploading' | 'ready' | 'queued' | 'processing' | 'done' | 'error'
 
-export default function TrimTool({ apiBase }: { apiBase: string }) {
+export default function TrimTool({ apiBase, initialUpload, onChainConsumed, onChainTo }: {
+  apiBase: string
+  initialUpload?: VideoUploadResult
+  onChainConsumed?: () => void
+  onChainTo?: (jobId: string, toolId: string) => void
+}) {
   const [file, setFile]       = useState<File | null>(null)
   const [stage, setStage]     = useState<Stage>('idle')
   const [upload, setUpload]   = useState<any>(null)
@@ -25,6 +30,17 @@ export default function TrimTool({ apiBase }: { apiBase: string }) {
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const addLog = (m: string) => setLog(p => [...p, m])
+
+  // Stage 2.1: a previous tool's output was sent here via "Send to Trim" —
+  // skip the upload step and start straight from 'ready'.
+  useEffect(() => {
+    if (!initialUpload) return
+    setUpload(initialUpload)
+    addLog(`✓ Received from previous step · ${initialUpload.width}×${initialUpload.height} · ${Number(initialUpload.duration).toFixed(1)}s`)
+    setStage('ready')
+    onChainConsumed?.()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialUpload])
 
   const startPoll = (jid: string) => {
     pollRef.current = setInterval(async () => {
@@ -152,17 +168,12 @@ export default function TrimTool({ apiBase }: { apiBase: string }) {
       <ErrorBox message={error} />
 
       {stage === 'done' && jobId && (
-        <Card className="p-4 flex flex-col gap-3">
-          <div className="flex items-center gap-2">
-            <div className="w-2 h-2 rounded-full bg-green animate-pulse" />
-            <span className="text-sm font-semibold text-text">
-              Trimd · {resultMb} MB · {FORMAT_LABELS[resultFmt] ?? resultFmt.toUpperCase()}
-            </span>
-          </div>
-          <DownloadBtn href={downloadUrl(jobId, apiBase)}
-            label={`Download ${FORMAT_LABELS[resultFmt] ?? resultFmt.toUpperCase()}`} />
-          <Btn onClick={reset} variant="ghost" fullWidth>Start Over</Btn>
-        </Card>
+        <ResultPreview
+          jobId={jobId} mb={resultMb} fmt={resultFmt} apiBase={apiBase} label="Trimmed"
+          sendToOptions={[{ id: 'crop', label: 'Crop' }]}
+          onSendTo={toolId => onChainTo?.(jobId, toolId)}
+          onReset={reset}
+        />
       )}
 
       {(stage === 'ready' || stage === 'error') && (
