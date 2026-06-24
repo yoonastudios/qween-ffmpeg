@@ -33,6 +33,12 @@ const MIME = {
   '.avi':  'video/x-msvideo',
   '.mkv':  'video/x-matroska',
   '.otf':  'font/otf',
+  '.mp3':  'audio/mpeg',
+  '.wav':  'audio/wav',
+  '.aac':  'audio/aac',
+  '.m4a':  'audio/mp4',
+  '.ogg':  'audio/ogg',
+  '.flac': 'audio/flac',
 };
 
 const PROJECTS_DIR = path.join(PUBLIC_DIR, 'projects');

@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 import aiofiles
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 # ── App setup ─────────────────────────────────────────────────────────────────
@@ -811,7 +811,7 @@ def job_status(job_id: str):
     # Fall back to disk check
     job_dir = WORK_DIR / job_id
     if not job_dir.exists(): raise HTTPException(404, "Job not found.")
-    has_output = any((job_dir / f"output{cfg['ext']}").exists() for cfg in FORMAT_CONFIG.values())
+    has_output = any((job_dir / f"output{cfg['ext']}").exists() for cfg in ALL_OUTPUT_CONFIG.values())
     return {"status": "done" if has_output else "running",
             "message": "Output ready." if has_output else "Processing…",
             "progress": 100 if has_output else 0}
