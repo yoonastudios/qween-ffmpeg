@@ -8,6 +8,8 @@ import ScaleTool   from '@/tools/ScaleTool'
 import SegmentTool from '@/tools/SegmentTool'
 import MergeTool   from '@/tools/MergeTool'
 import RecentTool  from '@/tools/RecentTool'
+import LibraryTool from '@/tools/LibraryTool'
+import AudioTool   from '@/tools/AudioTool'
 import { StorageBadge } from '@/components/ui'
 import { getStorage, cleanAllJobs, useAsSource } from '@/lib/api'
 import type { VideoUploadResult } from '@/lib/api'
@@ -22,19 +24,24 @@ const TOOLS = {
   scale:   { label: 'Scale',   desc: 'Resize output'   },
   segment: { label: 'Segment', desc: 'Split chunks'    },
   merge:   { label: 'Merge',   desc: 'Concat videos'   },
+  library: { label: 'Library', desc: 'Browse outputs'  },
+  audio:   { label: 'Audio',   desc: 'Extract / edit / merge audio' },
   recent:  { label: 'Recent',  desc: 'Job history'     },
 } as const
 type ToolId = keyof typeof TOOLS
 
-type CategoryId = 'build' | 'edit' | 'history'
+type CategoryId = 'build' | 'edit' | 'library' | 'audio' | 'history'
 const CATEGORIES: Record<CategoryId, { label: string; tools: ToolId[] }> = {
   build:   { label: 'Build',   tools: ['stitch', 'render'] },
   edit:    { label: 'Edit',    tools: ['crop', 'trim', 'scale', 'segment', 'merge'] },
+  library: { label: 'Library', tools: ['library'] },
+  audio:   { label: 'Audio',   tools: ['audio'] },
   history: { label: 'History', tools: ['recent'] },
 }
 const CATEGORY_OF: Record<ToolId, CategoryId> = {
   stitch: 'build', render: 'build',
   crop: 'edit', trim: 'edit', scale: 'edit', segment: 'edit', merge: 'edit',
+  library: 'library', audio: 'audio',
   recent: 'history',
 }
 
@@ -46,6 +53,12 @@ function CategoryIcon({ id }: { id: CategoryId }) {
   )
   if (id === 'edit') return (
     <svg {...common}><path d="M14 3l7 7-9 9H5v-7l9-9z"/><path d="M13 4l7 7"/></svg>
+  )
+  if (id === 'library') return (
+    <svg {...common}><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+  )
+  if (id === 'audio') return (
+    <svg {...common}><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
   )
   return (
     <svg {...common}><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg>
@@ -184,6 +197,8 @@ export default function Home() {
             {activeTool === 'scale'   && <ScaleTool   apiBase={API_BASE} />}
             {activeTool === 'segment' && <SegmentTool apiBase={API_BASE} />}
             {activeTool === 'merge'   && <MergeTool   apiBase={API_BASE} />}
+            {activeTool === 'library' && <LibraryTool apiBase={API_BASE} />}
+            {activeTool === 'audio'   && <AudioTool   apiBase={API_BASE} />}
             {activeTool === 'recent'  && <RecentTool  apiBase={API_BASE} />}
           </>
         )}

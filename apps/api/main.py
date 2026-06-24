@@ -50,6 +50,18 @@ FORMAT_CONFIG = {
 VALID_FORMATS       = set(FORMAT_CONFIG.keys())
 VALID_VIDEO_FORMATS = {"mp4", "mov", "webm"}
 
+# ── Audio format config ───────────────────────────────────────────────────────
+AUDIO_FORMAT_CONFIG = {
+    "mp3": {"ext": ".mp3", "mime": "audio/mpeg", "codec_args": ["-c:a", "libmp3lame", "-q:a", "2"]},
+    "wav": {"ext": ".wav", "mime": "audio/wav",  "codec_args": ["-c:a", "pcm_s16le"]},
+    "aac": {"ext": ".aac", "mime": "audio/aac",  "codec_args": ["-c:a", "aac", "-b:a", "192k"]},
+    "m4a": {"ext": ".m4a", "mime": "audio/mp4",  "codec_args": ["-c:a", "aac", "-b:a", "192k"]},
+}
+VALID_AUDIO_FORMATS = set(AUDIO_FORMAT_CONFIG.keys())
+ALLOWED_AUDIO_EXTS  = {".mp3", ".wav", ".aac", ".m4a", ".ogg", ".flac"}
+# Union used anywhere we need to resolve/serve *any* finished output (video or audio)
+ALL_OUTPUT_CONFIG = {**FORMAT_CONFIG, **AUDIO_FORMAT_CONFIG}
+
 # ── Asset store config ────────────────────────────────────────────────────────
 # ASSETS_DIR lives next to main.py (apps/api/assets/) so it is committed to the
 # repo file-system and survives deploys on single-host PaaS (CodeSandbox, Render,
@@ -244,7 +256,7 @@ def probe_video(path: Path) -> dict:
     }
 
 def output_path_for(job_dir: Path, fmt: str) -> Path:
-    return job_dir / f"output{FORMAT_CONFIG[fmt]['ext']}"
+    return job_dir / f"output{ALL_OUTPUT_CONFIG[fmt]['ext']}"
 
 def build_result(job_dir: Path, job_id: str, fmt: str) -> dict:
     p = output_path_for(job_dir, fmt)
@@ -253,6 +265,30 @@ def build_result(job_dir: Path, job_id: str, fmt: str) -> dict:
     return {"job_id": job_id, "format": fmt,
             "download_url": f"/jobs/{job_id}/download",
             "size_bytes": p.stat().st_size, "size_mb": mb}
+
+def _resolve_job_source_video(job_id: str) -> Path:
+    """Find the best usable video file for a job: a finished video output first,
+    falling back to the originally-uploaded input. Used by merge-existing and
+    extract-audio so they can source from any prior job, processed or not."""
+    job_dir = WORK_DIR / job_id
+    if not job_dir.exists():
+        raise HTTPException(404, f"Job {job_id[:8]} not found.")
+    for fmt in ("mp4", "mov", "webm"):
+        p = output_path_for(job_dir, fmt)
+        if p.exists(): return p
+    input_video = next(
+        (f for f in job_dir.iterdir()
+         if f.stem == "input" and f.suffix.lower() in {".mp4", ".mov", ".webm", ".avi", ".mkv"}), None)
+    if input_video: return input_video
+    raise HTTPException(404, f"Job {job_id[:8]} has no usable video output.")
+
+def probe_audio(path: Path) -> dict:
+    r = subprocess.run(
+        [FFPROBE_BIN, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True,
+    )
+    dur = r.stdout.strip().splitlines()[0] if r.stdout.strip() else "0"
+    return {"duration": dur}
 
 def build_vf(crop_x, crop_y, crop_w, crop_h, width, height) -> str | None:
     filters = []
@@ -588,6 +624,49 @@ async def process_video(
     return build_result(job_dir, job_id, format)
 
 # ── #6 — Merge multiple videos ────────────────────────────────────────────────
+def _merge_clips(job_id: str, job_dir: Path, sources: list[Path], format: str):
+    """Shared merge core: remux each source to a concat-safe mp4, concat, encode.
+    Used by both /jobs/merge (fresh uploads) and /jobs/merge-existing (Library)."""
+    try:
+        inputs_dir = job_dir / "inputs"; inputs_dir.mkdir(exist_ok=True)
+        concat_list = job_dir / "concat.txt"
+        remuxed = []
+        _job_update(job_id, status="processing", message="Preparing clips…", progress=10)
+
+        for i, src in enumerate(sources):
+            fixed = inputs_dir / f"clip_{i:03d}.mp4"
+            code, _, err = run_ffmpeg_queued(["-i", str(src), "-c", "copy",
+                                       "-movflags", "faststart", str(fixed)])
+            if code != 0:
+                code, _, err = run_ffmpeg_queued(["-i", str(src), "-c:v", "libx264",
+                                           "-crf", "18", "-preset", "fast",
+                                           "-movflags", "faststart", str(fixed)])
+            if code != 0:
+                raise RuntimeError(f"Could not process clip {i+1}: {friendly_ffmpeg_error(err)}")
+            remuxed.append(fixed)
+            pct = 10 + int((i + 1) / len(sources) * 40)
+            _job_update(job_id, message=f"Prepared clip {i+1}/{len(sources)}…", progress=pct)
+
+        concat_list.write_text("\n".join(f"file '{p}'" for p in remuxed))
+        _job_update(job_id, status="processing", message="Merging clips…", progress=55)
+
+        output = output_path_for(job_dir, format)
+        cfg    = FORMAT_CONFIG[format]
+        code, _, err = run_ffmpeg_queued([
+            "-f", "concat", "-safe", "0", "-i", str(concat_list),
+            *cfg["codec_args"],
+            *((["-crf", "18", "-preset", "medium"]) if format in ("mp4", "mov") else ["-crf", "18", "-b:v", "0"]),
+            str(output),
+        ])
+        if code != 0: raise RuntimeError(friendly_ffmpeg_error(err))
+
+        mb = round(output.stat().st_size / 1_048_576, 2)
+        _mark_output(job_id, format, mb)
+        _job_update(job_id, status="done", message=f"Done — {mb} MB",
+                    progress=100, size_mb=mb, format=format)
+    except Exception as e:
+        _job_update(job_id, status="error", message=str(e), progress=0)
+
 @app.post("/jobs/merge")
 async def merge_videos(
     files: List[UploadFile] = File(...),
@@ -602,55 +681,34 @@ async def merge_videos(
     _job_init(job_id, label=f"Merge {len(files)} files → {format.upper()}")
     inputs_dir = job_dir / "inputs"; inputs_dir.mkdir()
 
-    def _do_merge():
-        try:
-            _job_update(job_id, status="processing", message="Uploading & remuxing inputs…", progress=10)
-            concat_list = job_dir / "concat.txt"
-            remuxed = []
+    raw_paths = []
+    for i, f in enumerate(files):
+        data   = await f.read()
+        suffix = Path(f.filename).suffix.lower() or ".mp4"
+        raw    = inputs_dir / f"raw_{i:03d}{suffix}"
+        raw.write_bytes(data)
+        raw_paths.append(raw)
 
-            for i, f in enumerate(files):  # files already read — use stored bytes
-                suffix = Path(f.filename).suffix.lower()
-                raw    = inputs_dir / f"raw_{i:03d}{suffix}"
-                fixed  = inputs_dir / f"clip_{i:03d}.mp4"
-                # Already read above; write synchronously inside thread
-                raw.write_bytes(f._body)  # stashed below
-                code, _, err = run_ffmpeg_queued(["-i", str(raw), "-c", "copy",
-                                           "-movflags", "faststart", str(fixed)])
-                if code != 0:
-                    code, _, err = run_ffmpeg_queued(["-i", str(raw), "-c:v", "libx264",
-                                               "-crf", "18", "-preset", "fast",
-                                               "-movflags", "faststart", str(fixed)])
-                if code != 0:
-                    raise RuntimeError(f"Could not process clip {i+1}: {friendly_ffmpeg_error(err)}")
-                remuxed.append(fixed)
-                pct = 10 + int((i + 1) / len(files) * 40)
-                _job_update(job_id, message=f"Prepared clip {i+1}/{len(files)}…", progress=pct)
+    threading.Thread(target=_merge_clips, args=(job_id, job_dir, raw_paths, format), daemon=True).start()
+    return {"job_id": job_id, "status": "queued", "poll_url": f"/jobs/{job_id}/status"}
 
-            concat_list.write_text("\n".join(f"file '{p}'" for p in remuxed))
-            _job_update(job_id, status="processing", message="Merging clips…", progress=55)
+# ── Merge from Library: select existing job outputs instead of re-uploading ──
+@app.post("/jobs/merge-existing")
+async def merge_existing(
+    job_ids: List[str] = Form(...),
+    format: str = Form("mp4"),
+):
+    if format not in VALID_VIDEO_FORMATS:
+        raise HTTPException(400, f"Invalid format. Choose from: {', '.join(sorted(VALID_VIDEO_FORMATS))}")
+    if len(job_ids) < 2:
+        raise HTTPException(400, "Select at least 2 outputs to merge.")
 
-            output = output_path_for(job_dir, format)
-            cfg    = FORMAT_CONFIG[format]
-            code, _, err = run_ffmpeg_queued([
-                "-f", "concat", "-safe", "0", "-i", str(concat_list),
-                *cfg["codec_args"],
-                *((["-crf", "18", "-preset", "medium"]) if format in ("mp4", "mov") else ["-crf", "18", "-b:v", "0"]),
-                str(output),
-            ])
-            if code != 0: raise RuntimeError(friendly_ffmpeg_error(err))
+    sources = [_resolve_job_source_video(jid) for jid in job_ids]
 
-            mb = round(output.stat().st_size / 1_048_576, 2)
-            _mark_output(job_id, format, mb)
-            _job_update(job_id, status="done", message=f"Done — {mb} MB",
-                        progress=100, size_mb=mb, format=format)
-        except Exception as e:
-            _job_update(job_id, status="error", message=str(e), progress=0)
+    job_id, job_dir = new_job(label=f"Merge {len(job_ids)} outputs → {format.upper()}")
+    _job_init(job_id, label=f"Merge {len(job_ids)} outputs → {format.upper()}")
 
-    # Read all file bytes before handing off to thread
-    for f in files:
-        f._body = await f.read()
-
-    threading.Thread(target=_do_merge, daemon=True).start()
+    threading.Thread(target=_merge_clips, args=(job_id, job_dir, sources, format), daemon=True).start()
     return {"job_id": job_id, "status": "queued", "poll_url": f"/jobs/{job_id}/status"}
 
 # ── Download ──────────────────────────────────────────────────────────────────
@@ -662,8 +720,8 @@ def download(job_id: str):
     if png_zip.exists():
         return FileResponse(png_zip, media_type="application/zip",
                             filename=f"qween_{job_id[:8]}_frames.zip")
-    # Video outputs
-    for fmt, cfg in FORMAT_CONFIG.items():
+    # Video + audio outputs
+    for fmt, cfg in ALL_OUTPUT_CONFIG.items():
         p = job_dir / f"output{cfg['ext']}"
         if p.exists():
             return FileResponse(p, media_type=cfg["mime"],
@@ -716,11 +774,11 @@ def list_jobs():
         async_meta = _async_jobs.get(d.name, {})
         flat       = d / "flat"
         fc         = len(list(flat.iterdir())) if flat.exists() else 0
-        out_fmt    = next((fmt for fmt, cfg in FORMAT_CONFIG.items()
+        out_fmt    = next((fmt for fmt, cfg in ALL_OUTPUT_CONFIG.items()
                            if (d / f"output{cfg['ext']}").exists()), None)
         out_size   = None
         if out_fmt:
-            p = d / f"output{FORMAT_CONFIG[out_fmt]['ext']}"
+            p = d / f"output{ALL_OUTPUT_CONFIG[out_fmt]['ext']}"
             out_size = round(p.stat().st_size / 1_048_576, 2)
         jobs.append({
             "job_id":     d.name,
@@ -730,6 +788,7 @@ def list_jobs():
             "frame_count": fc,
             "has_output": out_fmt is not None,
             "format":     out_fmt,
+            "is_audio":   out_fmt in VALID_AUDIO_FORMATS if out_fmt else False,
             "size_mb":    out_size,
             "async_status": async_meta.get("status"),
         })
@@ -756,6 +815,160 @@ def job_status(job_id: str):
     return {"status": "done" if has_output else "running",
             "message": "Output ready." if has_output else "Processing…",
             "progress": 100 if has_output else 0}
+
+
+# ── Audio Tools ───────────────────────────────────────────────────────────────
+@app.post("/jobs/upload-audio")
+async def upload_audio(file: UploadFile = File(...)):
+    suffix = Path(file.filename).suffix.lower()
+    if suffix not in ALLOWED_AUDIO_EXTS:
+        raise HTTPException(400, f"Unsupported type '{suffix}'. Allowed: {', '.join(sorted(ALLOWED_AUDIO_EXTS))}")
+    data = await file.read()
+    size_mb = len(data) / 1_048_576
+    if size_mb > MAX_VIDEO_MB:
+        raise HTTPException(413, f"File too large ({size_mb:.0f} MB). Max is {MAX_VIDEO_MB} MB.")
+    job_id, job_dir = new_job(label=file.filename, input_file=file.filename)
+    audio_path = job_dir / f"input{suffix}"
+    async with aiofiles.open(audio_path, "wb") as f: await f.write(data)
+    info = probe_audio(audio_path)
+    return {"job_id": job_id, "duration": info["duration"], "size_mb": round(size_mb, 1)}
+
+# Extract audio out of any prior video job (rendered output or raw upload) —
+# always creates a *new* job so the source job's video output is untouched.
+@app.post("/jobs/{job_id}/extract-audio")
+async def extract_audio(job_id: str, format: str = Form("mp3")):
+    if format not in VALID_AUDIO_FORMATS:
+        raise HTTPException(400, f"Invalid format. Choose from: {', '.join(sorted(VALID_AUDIO_FORMATS))}")
+    src = _resolve_job_source_video(job_id)
+
+    new_id, new_dir = new_job(label=f"Extract audio → {format.upper()}", input_file=src.name)
+    _job_init(new_id, label=f"Extract audio → {format.upper()}")
+
+    def _do():
+        try:
+            _job_update(new_id, status="processing", message="Extracting audio…", progress=30)
+            output = output_path_for(new_dir, format)
+            cfg    = AUDIO_FORMAT_CONFIG[format]
+            code, _, err = run_ffmpeg_queued(["-i", str(src), "-vn", *cfg["codec_args"], str(output)])
+            if code != 0: raise RuntimeError(friendly_ffmpeg_error(err))
+            mb = round(output.stat().st_size / 1_048_576, 2)
+            _mark_output(new_id, format, mb)
+            _job_update(new_id, status="done", message=f"Done — {mb} MB",
+                        progress=100, size_mb=mb, format=format)
+        except Exception as e:
+            _job_update(new_id, status="error", message=str(e), progress=0)
+
+    threading.Thread(target=_do, daemon=True).start()
+    return {"job_id": new_id, "status": "queued", "poll_url": f"/jobs/{new_id}/status"}
+
+# Trim / volume / normalize / format-convert in one pass, operating in-place on
+# a job created via /jobs/upload-audio (same convention as /jobs/{id}/process).
+@app.post("/jobs/{job_id}/audio-process")
+async def audio_process(
+    job_id: str,
+    format: str = Form("mp3"),
+    trim_start: Optional[str] = Form(None),
+    trim_end: Optional[str] = Form(None),
+    volume_db: Optional[str] = Form(None),
+    normalize: bool = Form(False),
+):
+    if format not in VALID_AUDIO_FORMATS:
+        raise HTTPException(400, f"Invalid format. Choose from: {', '.join(sorted(VALID_AUDIO_FORMATS))}")
+    job_dir = WORK_DIR / job_id
+    if not job_dir.exists(): raise HTTPException(404, "Job not found.")
+    input_audio = next(
+        (f for f in job_dir.iterdir()
+         if f.stem == "input" and f.suffix.lower() in ALLOWED_AUDIO_EXTS), None)
+    if not input_audio:
+        raise HTTPException(404, "No input audio found. Use /jobs/upload-audio first.")
+
+    _job_init(job_id, label=f"Audio edit → {format.upper()}")
+
+    def _do():
+        try:
+            _job_update(job_id, status="processing", message="Processing audio…", progress=20)
+            ts, te, vol = to_float(trim_start), to_float(trim_end), to_float(volume_db)
+            args = []
+            if ts is not None: args += ["-ss", str(ts)]
+            args += ["-i", str(input_audio)]
+            if te is not None: args += ["-to", str(te)]
+            filters = []
+            if normalize: filters.append("loudnorm=I=-16:LRA=11:TP=-1.5")
+            if vol is not None: filters.append(f"volume={vol}dB")
+            if filters: args += ["-af", ",".join(filters)]
+            cfg = AUDIO_FORMAT_CONFIG[format]
+            output = output_path_for(job_dir, format)
+            args += [*cfg["codec_args"], str(output)]
+            code, _, err = run_ffmpeg_queued(args)
+            if code != 0: raise RuntimeError(friendly_ffmpeg_error(err))
+            mb = round(output.stat().st_size / 1_048_576, 2)
+            _mark_output(job_id, format, mb)
+            _job_update(job_id, status="done", message=f"Done — {mb} MB",
+                        progress=100, size_mb=mb, format=format)
+        except Exception as e:
+            _job_update(job_id, status="error", message=str(e), progress=0)
+
+    threading.Thread(target=_do, daemon=True).start()
+    return {"job_id": job_id, "status": "queued", "poll_url": f"/jobs/{job_id}/status"}
+
+# Merge/concat multiple audio files. Sources may have different codecs/sample
+# rates, so each is normalized to PCM WAV before the final concat+encode pass —
+# mirrors the remux-first strategy used for video merge.
+@app.post("/jobs/audio-merge")
+async def audio_merge(
+    files: List[UploadFile] = File(...),
+    format: str = Form("mp3"),
+):
+    if format not in VALID_AUDIO_FORMATS:
+        raise HTTPException(400, f"Invalid format. Choose from: {', '.join(sorted(VALID_AUDIO_FORMATS))}")
+    if len(files) < 2:
+        raise HTTPException(400, "Please provide at least 2 audio files to merge.")
+
+    job_id, job_dir = new_job(label=f"Merge {len(files)} audio → {format.upper()}")
+    _job_init(job_id, label=f"Merge {len(files)} audio → {format.upper()}")
+    inputs_dir = job_dir / "inputs"; inputs_dir.mkdir()
+
+    raw_paths = []
+    for i, f in enumerate(files):
+        data   = await f.read()
+        suffix = Path(f.filename).suffix.lower() or ".mp3"
+        raw    = inputs_dir / f"raw_{i:03d}{suffix}"
+        raw.write_bytes(data)
+        raw_paths.append(raw)
+
+    def _do():
+        try:
+            _job_update(job_id, status="processing", message="Preparing clips…", progress=15)
+            inter_files = []
+            for i, p in enumerate(raw_paths):
+                inter = inputs_dir / f"norm_{i:03d}.wav"
+                code, _, err = run_ffmpeg_queued(["-i", str(p), "-ar", "44100", "-ac", "2", str(inter)])
+                if code != 0:
+                    raise RuntimeError(f"Could not process clip {i+1}: {friendly_ffmpeg_error(err)}")
+                inter_files.append(inter)
+                pct = 15 + int((i + 1) / len(raw_paths) * 40)
+                _job_update(job_id, message=f"Prepared clip {i+1}/{len(raw_paths)}…", progress=pct)
+
+            concat_list = job_dir / "concat.txt"
+            concat_list.write_text("\n".join(f"file '{p}'" for p in inter_files))
+            _job_update(job_id, status="processing", message="Merging audio…", progress=60)
+
+            output = output_path_for(job_dir, format)
+            cfg    = AUDIO_FORMAT_CONFIG[format]
+            code, _, err = run_ffmpeg_queued([
+                "-f", "concat", "-safe", "0", "-i", str(concat_list),
+                *cfg["codec_args"], str(output),
+            ])
+            if code != 0: raise RuntimeError(friendly_ffmpeg_error(err))
+            mb = round(output.stat().st_size / 1_048_576, 2)
+            _mark_output(job_id, format, mb)
+            _job_update(job_id, status="done", message=f"Done — {mb} MB",
+                        progress=100, size_mb=mb, format=format)
+        except Exception as e:
+            _job_update(job_id, status="error", message=str(e), progress=0)
+
+    threading.Thread(target=_do, daemon=True).start()
+    return {"job_id": job_id, "status": "queued", "poll_url": f"/jobs/{job_id}/status"}
 
 
 # ── Alpha WebM (dual-stream alphamerge) ───────────────────────────────────────

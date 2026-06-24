@@ -198,13 +198,20 @@ export async function useAsSource(jobId: string, base = DEFAULT_BASE): Promise<V
   return apiFetch(`${base}/jobs/${jobId}/use-as-source`, { method: 'POST' }, 'Could not send job to next tool')
 }
 
-// ── URLs ──────────────────────────────────────────────────────────────────────
+// ── Merge from Library: select existing job outputs instead of re-uploading ──
+export interface QueuedJobResult { job_id: string; status: string; poll_url: string }
+export async function mergeExisting(jobIds: string[], format: VideoFormat, base = DEFAULT_BASE): Promise<QueuedJobResult> {
+  const fd = new FormData()
+  jobIds.forEach(id => fd.append('job_ids', id))
+  fd.append('format', format)
+  return apiFetch(`${base}/jobs/merge-existing`, { method: 'POST', body: fd }, 'Merge failed')
+}
 export const downloadUrl        = (jobId: string, base = DEFAULT_BASE) => `${base}/jobs/${jobId}/download`
 export const segmentDownloadUrl = (jobId: string, idx: number, base = DEFAULT_BASE) => `${base}/jobs/${jobId}/segment/${idx}`
 export const frameUrl           = (jobId: string, idx: number, base = DEFAULT_BASE) => `${base}/jobs/${jobId}/frame/${idx}`
 
 // ── Format helpers ────────────────────────────────────────────────────────────
-export const FORMAT_LABELS: Record<string, string> = { mp4: 'MP4', mov: 'MOV', webm: 'WebM', gif: 'GIF' }
+export const FORMAT_LABELS: Record<string, string> = { mp4: 'MP4', mov: 'MOV', webm: 'WebM', gif: 'GIF', mp3: 'MP3', wav: 'WAV', aac: 'AAC', m4a: 'M4A' }
 export const VIDEO_FORMATS: VideoFormat[]  = ['mp4', 'mov', 'webm']
 export const ALL_FORMATS:   OutputFormat[] = ['mp4', 'mov', 'webm', 'gif']
 
@@ -213,6 +220,7 @@ export interface JobRecord {
   job_id: string; label: string; input_file: string
   created_at: number; frame_count: number
   has_output: boolean; format: string | null; size_mb: number | null
+  is_audio?: boolean
 }
 export async function listJobs(base = DEFAULT_BASE): Promise<{ jobs: JobRecord[] }> {
   return apiFetch(`${base}/jobs`, { method: 'GET' }, 'Could not fetch jobs')
@@ -226,3 +234,53 @@ export interface JobStatus {
 export async function getJobStatus(jobId: string, base = DEFAULT_BASE): Promise<JobStatus> {
   return apiFetch(`${base}/jobs/${jobId}/status`, { method: 'GET' }, 'Could not fetch status')
 }
+
+// ── Audio tools ────────────────────────────────────────────────────────────────
+export type AudioFormat = 'mp3' | 'wav' | 'aac' | 'm4a'
+export const AUDIO_FORMATS: AudioFormat[] = ['mp3', 'wav', 'aac', 'm4a']
+export const AUDIO_FORMAT_LABELS: Record<string, string> = { mp3: 'MP3', wav: 'WAV', aac: 'AAC', m4a: 'M4A' }
+const ALLOWED_AUDIO_EXTS = ['.mp3', '.wav', '.aac', '.m4a', '.ogg', '.flac']
+
+export function validateAudioFile(file: File): string | null {
+  const mb = file.size / 1_048_576
+  if (!ALLOWED_AUDIO_EXTS.some(ext => file.name.toLowerCase().endsWith(ext)))
+    return `Unsupported file type. Allowed: ${ALLOWED_AUDIO_EXTS.join(', ')}`
+  if (mb > MAX_VIDEO_MB) return `File too large (${mb.toFixed(0)} MB). Maximum is ${MAX_VIDEO_MB} MB.`
+  return null
+}
+
+export interface AudioUploadResult { job_id: string; duration: string; size_mb: number }
+export async function uploadAudio(
+  file: File, base = DEFAULT_BASE, onProgress?: (pct: number) => void,
+): Promise<AudioUploadResult> {
+  const err = validateAudioFile(file)
+  if (err) throw new Error(err)
+  const fd = new FormData(); fd.append('file', file)
+  if (onProgress) return uploadWithProgress(`${base}/jobs/upload-audio`, fd, onProgress)
+  return apiFetch(`${base}/jobs/upload-audio`, { method: 'POST', body: fd }, 'Upload failed')
+}
+
+// Extract audio from any prior video job (works on render/process/upload outputs alike)
+export async function extractAudio(jobId: string, format: AudioFormat, base = DEFAULT_BASE): Promise<QueuedJobResult> {
+  const fd = new FormData(); fd.append('format', format)
+  return apiFetch(`${base}/jobs/${jobId}/extract-audio`, { method: 'POST', body: fd }, 'Extract failed')
+}
+
+export interface AudioProcessParams {
+  format: AudioFormat; trim_start?: number; trim_end?: number
+  volume_db?: number; normalize?: boolean
+}
+export async function audioProcess(jobId: string, params: AudioProcessParams, base = DEFAULT_BASE): Promise<QueuedJobResult> {
+  const fd = new FormData()
+  Object.entries(params).forEach(([k, v]) => { if (v !== undefined && v !== null && v !== '') fd.append(k, String(v)) })
+  return apiFetch(`${base}/jobs/${jobId}/audio-process`, { method: 'POST', body: fd }, 'Audio processing failed')
+}
+
+export async function audioMerge(files: File[], format: AudioFormat, base = DEFAULT_BASE): Promise<QueuedJobResult> {
+  const fd = new FormData()
+  files.forEach(f => fd.append('files', f))
+  fd.append('format', format)
+  return apiFetch(`${base}/jobs/audio-merge`, { method: 'POST', body: fd }, 'Merge failed')
+}
+
+export const audioDownloadUrl = (jobId: string, base = DEFAULT_BASE) => `${base}/jobs/${jobId}/download`
