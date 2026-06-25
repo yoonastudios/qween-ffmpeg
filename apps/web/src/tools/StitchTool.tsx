@@ -2,7 +2,7 @@
 import { useState, useRef } from 'react'
 import { DropZone, Btn, Card, Field, NumInput, PillGroup, Select, SectionTitle,
          LogBox, ErrorBox, DownloadBtn, FramePreview, UploadProgress } from '@/components/ui'
-import { uploadZip, downloadUrl, ALL_FORMATS, FORMAT_LABELS } from '@/lib/api'
+import { uploadZip, downloadUrl, ALL_FORMATS, FORMAT_LABELS, CRF_RANGE } from '@/lib/api'
 import type { OutputFormat } from '@/lib/api'
 
 const PRESETS = ['ultrafast','superfast','veryfast','faster','fast','medium','slow','veryslow'].map(v=>({value:v,label:v}))
@@ -130,7 +130,7 @@ export default function StitchTool({ apiBase }: { apiBase: string }) {
             <Field label={`Quality — CRF ${crf}`} hint={crf<=18?'✦ visually lossless':crf<=28?'✦ good':'⚠ lossy'}>
               <div className="flex items-center gap-3">
                 <span className="text-xs font-mono text-green">best</span>
-                <input type="range" min={0} max={51} value={crf} onChange={e=>setCrf(Number(e.target.value))} />
+                <input type="range" min={0} max={CRF_RANGE[format]?.[1] ?? 51} value={crf} onChange={e=>setCrf(Number(e.target.value))} />
                 <span className="text-xs font-mono text-red">worst</span>
               </div>
             </Field>

@@ -1,15 +1,16 @@
 'use client'
 import { useState, useEffect, useCallback } from 'react'
-import StitchTool  from '@/tools/StitchTool'
-import RenderTool  from '@/tools/RenderTool'
-import CropTool    from '@/tools/CropTool'
-import TrimTool    from '@/tools/TrimTool'
-import ScaleTool   from '@/tools/ScaleTool'
-import SegmentTool from '@/tools/SegmentTool'
-import MergeTool   from '@/tools/MergeTool'
-import RecentTool  from '@/tools/RecentTool'
-import LibraryTool from '@/tools/LibraryTool'
-import AudioTool   from '@/tools/AudioTool'
+import StitchTool   from '@/tools/StitchTool'
+import RenderTool   from '@/tools/RenderTool'
+import CropTool     from '@/tools/CropTool'
+import TrimTool     from '@/tools/TrimTool'
+import ScaleTool    from '@/tools/ScaleTool'
+import SegmentTool  from '@/tools/SegmentTool'
+import MergeTool    from '@/tools/MergeTool'
+import PipelineTool from '@/tools/PipelineTool'
+import RecentTool   from '@/tools/RecentTool'
+import LibraryTool  from '@/tools/LibraryTool'
+import AudioTool    from '@/tools/AudioTool'
 import { StorageBadge } from '@/components/ui'
 import { getStorage, cleanAllJobs, useAsSource } from '@/lib/api'
 import type { VideoUploadResult } from '@/lib/api'
@@ -17,30 +18,31 @@ import type { VideoUploadResult } from '@/lib/api'
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? '/api/ffmpeg'
 
 const TOOLS = {
-  stitch:  { label: 'Stitch',  desc: 'Frames → Video' },
-  render:  { label: 'Render',  desc: 'Project → Video' },
-  crop:    { label: 'Crop',    desc: 'Crop region'     },
-  trim:    { label: 'Trim',    desc: 'Cut start/end'   },
-  scale:   { label: 'Scale',   desc: 'Resize output'   },
-  segment: { label: 'Segment', desc: 'Split chunks'    },
-  merge:   { label: 'Merge',   desc: 'Concat videos'   },
-  library: { label: 'Library', desc: 'Browse outputs'  },
-  audio:   { label: 'Audio',   desc: 'Extract / edit / merge audio' },
-  recent:  { label: 'Recent',  desc: 'Job history'     },
+  stitch:   { label: 'Stitch',   desc: 'Frames → Video' },
+  render:   { label: 'Render',   desc: 'Project → Video' },
+  crop:     { label: 'Crop',     desc: 'Crop region'     },
+  trim:     { label: 'Trim',     desc: 'Cut start/end'   },
+  scale:    { label: 'Scale',    desc: 'Resize output'   },
+  segment:  { label: 'Segment',  desc: 'Split chunks'    },
+  merge:    { label: 'Merge',    desc: 'Concat videos'   },
+  pipeline: { label: 'Pipeline', desc: 'Crop+Trim+Scale+Speed in one pass' },
+  library:  { label: 'Library',  desc: 'Browse outputs'  },
+  audio:    { label: 'Audio',    desc: 'Extract / edit / merge audio' },
+  recent:   { label: 'Recent',   desc: 'Job history'     },
 } as const
 type ToolId = keyof typeof TOOLS
 
 type CategoryId = 'build' | 'edit' | 'library' | 'audio' | 'history'
 const CATEGORIES: Record<CategoryId, { label: string; tools: ToolId[] }> = {
   build:   { label: 'Build',   tools: ['stitch', 'render'] },
-  edit:    { label: 'Edit',    tools: ['crop', 'trim', 'scale', 'segment', 'merge'] },
+  edit:    { label: 'Edit',    tools: ['crop', 'trim', 'scale', 'segment', 'merge', 'pipeline'] },
   library: { label: 'Library', tools: ['library'] },
   audio:   { label: 'Audio',   tools: ['audio'] },
   history: { label: 'History', tools: ['recent'] },
 }
 const CATEGORY_OF: Record<ToolId, CategoryId> = {
   stitch: 'build', render: 'build',
-  crop: 'edit', trim: 'edit', scale: 'edit', segment: 'edit', merge: 'edit',
+  crop: 'edit', trim: 'edit', scale: 'edit', segment: 'edit', merge: 'edit', pipeline: 'edit',
   library: 'library', audio: 'audio',
   recent: 'history',
 }
@@ -196,7 +198,8 @@ export default function Home() {
             )}
             {activeTool === 'scale'   && <ScaleTool   apiBase={API_BASE} />}
             {activeTool === 'segment' && <SegmentTool apiBase={API_BASE} />}
-            {activeTool === 'merge'   && <MergeTool   apiBase={API_BASE} />}
+            {activeTool === 'merge'    && <MergeTool    apiBase={API_BASE} />}
+            {activeTool === 'pipeline' && <PipelineTool apiBase={API_BASE} />}
             {activeTool === 'library' && <LibraryTool apiBase={API_BASE} />}
             {activeTool === 'audio'   && <AudioTool   apiBase={API_BASE} />}
             {activeTool === 'recent'  && <RecentTool  apiBase={API_BASE} />}

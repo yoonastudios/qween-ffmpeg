@@ -24,6 +24,7 @@ export interface ProcessParams {
   format: VideoFormat; crf?: number; preset?: string
   width?: number; height?: number; trim_start?: number; trim_end?: number
   crop_x?: number; crop_y?: number; crop_w?: number; crop_h?: number
+  speed?: number; async_mode?: boolean
 }
 export interface StorageInfo {
   storage_used_mb: number; job_count: number; auto_clean_hours: number
@@ -142,8 +143,8 @@ export async function stitch(jobId: string, params: StitchParams, base = DEFAULT
   return apiFetch(`${base}/jobs/${jobId}/stitch`, { method: 'POST', body: fd }, 'Stitch failed')
 }
 
-// ── Process ───────────────────────────────────────────────────────────────────
-export async function processVideo(jobId: string, params: ProcessParams, base = DEFAULT_BASE): Promise<ProcessResult> {
+// ── Process (crop/trim/scale/speed — combinable in one call, see PipelineTool) ─
+export async function processVideo(jobId: string, params: ProcessParams, base = DEFAULT_BASE): Promise<ProcessResult | QueuedJobResult> {
   const fd = new FormData()
   Object.entries(params).forEach(([k, v]) => { if (v !== undefined && v !== null && v !== '') fd.append(k, String(v)) })
   return apiFetch(`${base}/jobs/${jobId}/process`, { method: 'POST', body: fd }, 'Process failed')
@@ -214,13 +215,17 @@ export const frameUrl           = (jobId: string, idx: number, base = DEFAULT_BA
 export const FORMAT_LABELS: Record<string, string> = { mp4: 'MP4', mov: 'MOV', webm: 'WebM', gif: 'GIF', mp3: 'MP3', wav: 'WAV', aac: 'AAC', m4a: 'M4A' }
 export const VIDEO_FORMATS: VideoFormat[]  = ['mp4', 'mov', 'webm']
 export const ALL_FORMATS:   OutputFormat[] = ['mp4', 'mov', 'webm', 'gif']
+// x264 (mp4/mov) CRF is 0–51; VP9 (webm) uses a wider ~0–63 scale. Quality
+// sliders should size their max to the selected format instead of always
+// capping at 51 (which silently limited webm's achievable quality range).
+export const CRF_RANGE: Record<string, [number, number]> = { mp4: [0, 51], mov: [0, 51], webm: [0, 63] }
 
 // ── Jobs list (for Recent tab) ────────────────────────────────────────────────
 export interface JobRecord {
   job_id: string; label: string; input_file: string
   created_at: number; frame_count: number
   has_output: boolean; format: string | null; size_mb: number | null
-  is_audio?: boolean
+  is_audio?: boolean; is_thumbnail?: boolean
 }
 export async function listJobs(base = DEFAULT_BASE): Promise<{ jobs: JobRecord[] }> {
   return apiFetch(`${base}/jobs`, { method: 'GET' }, 'Could not fetch jobs')
@@ -284,3 +289,12 @@ export async function audioMerge(files: File[], format: AudioFormat, base = DEFA
 }
 
 export const audioDownloadUrl = (jobId: string, base = DEFAULT_BASE) => `${base}/jobs/${jobId}/download`
+
+// ── Thumbnail / poster-frame extraction ───────────────────────────────────────
+export type ThumbnailFormat = 'jpg' | 'png'
+export async function extractThumbnail(
+  jobId: string, time: number, format: ThumbnailFormat = 'jpg', base = DEFAULT_BASE,
+): Promise<ProcessResult> {
+  const fd = new FormData(); fd.append('time', String(time)); fd.append('format', format)
+  return apiFetch(`${base}/jobs/${jobId}/thumbnail`, { method: 'POST', body: fd }, 'Thumbnail extraction failed')
+}

@@ -1,7 +1,7 @@
 'use client'
 import { useState, useEffect, useCallback } from 'react'
 import { Card, SectionTitle, Btn, DownloadBtn, ErrorBox, PillGroup } from '@/components/ui'
-import { listJobs, mergeExisting, getJobStatus, downloadUrl, FORMAT_LABELS, VIDEO_FORMATS } from '@/lib/api'
+import { listJobs, mergeExisting, getJobStatus, downloadUrl, extractThumbnail, FORMAT_LABELS, VIDEO_FORMATS } from '@/lib/api'
 import type { JobRecord, VideoFormat } from '@/lib/api'
 
 function timeAgo(ts: number): string {
@@ -25,13 +25,25 @@ export default function LibraryTool({ apiBase }: { apiBase: string }) {
   const [progress, setProgress] = useState(0)
   const [message, setMessage] = useState('')
   const [resultMb, setResultMb] = useState<number | null>(null)
+  const [thumbnailingId, setThumbnailingId] = useState<string | null>(null)
+
+  const handleThumbnail = async (e: React.MouseEvent, job: JobRecord) => {
+    e.stopPropagation()
+    if (thumbnailingId) return
+    setThumbnailingId(job.job_id); setError('')
+    try {
+      const r = await extractThumbnail(job.job_id, 0, 'jpg', apiBase)
+      window.open(downloadUrl(r.job_id, apiBase), '_blank')
+    } catch (err: any) { setError(err.message) }
+    finally { setThumbnailingId(null) }
+  }
 
   const fetchJobs = useCallback(async () => {
     setError('')
     try {
       const r = await listJobs(apiBase)
-      // Only finished video outputs are mergeable — exclude audio-only jobs.
-      setJobs(r.jobs.filter(j => j.has_output && !j.is_audio))
+      // Only finished video outputs are mergeable — exclude audio-only and thumbnail-only jobs.
+      setJobs(r.jobs.filter(j => j.has_output && !j.is_audio && !j.is_thumbnail))
     } catch (e: any) { setError(e.message) }
     finally { setLoading(false) }
   }, [apiBase])
@@ -145,6 +157,19 @@ export default function LibraryTool({ apiBase }: { apiBase: string }) {
               <div className="flex items-center gap-2 shrink-0 text-[10px] font-mono text-muted">
                 {job.format && <span className="text-accent">{FORMAT_LABELS[job.format] ?? job.format.toUpperCase()}</span>}
                 {job.size_mb && <span>{job.size_mb} MB</span>}
+                <button onClick={e => handleThumbnail(e, job)} disabled={thumbnailingId === job.job_id}
+                  title="Grab thumbnail"
+                  className="w-7 h-7 rounded-md bg-bg border border-border text-muted hover:border-accent/40 hover:text-accent
+                    disabled:opacity-40 flex items-center justify-center active:scale-90 transition-colors">
+                  {thumbnailingId === job.job_id ? (
+                    <span className="w-3 h-3 border-2 border-current border-t-transparent rounded-full animate-spin" />
+                  ) : (
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
+                      <circle cx="12" cy="13" r="4"/>
+                    </svg>
+                  )}
+                </button>
               </div>
             </div>
           )

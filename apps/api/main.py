@@ -40,15 +40,60 @@ _pinned_ffprobe = Path(os.environ.get("FFMPEG_DIR", "/opt/ffmpeg-pinned")) / "ff
 FFMPEG_BIN  = os.environ.get("FFMPEG_BIN")  or (str(_pinned_ffmpeg)  if _pinned_ffmpeg.is_file()  else "ffmpeg")
 FFPROBE_BIN = os.environ.get("FFPROBE_BIN") or (str(_pinned_ffprobe) if _pinned_ffprobe.is_file() else "ffprobe")
 
+# ── Hardware-encoder probe ───────────────────────────────────────────────────────
+# Detect-only for now: reports what's available (visible via /health) so an
+# operator can tell whether a deploy target has NVENC/QSV/VideoToolbox before
+# wiring it in. NOT switched into the actual encode path yet — each hardware
+# encoder needs different rate-control flags (nvenc: -rc vbr -cq N, qsv: -global_quality
+# N, videotoolbox: -q:v N — none of them take -crf/-preset like libx264) and
+# those argument combinations can't be verified without the real hardware, so
+# shipping them unverified would be worse than not shipping them. Once a GPU
+# target is available to validate against, swap HW_ENCODERS["mp4"] etc. into
+# FORMAT_CONFIG's codec_args behind an explicit opt-in (env var or form field).
+def _probe_hw_encoders() -> dict:
+    """Real test-encode per candidate, not just a text-match against
+    `ffmpeg -encoders` — an encoder being *compiled in* doesn't mean the
+    actual hardware/driver is present at runtime (confirmed: this exact
+    false positive shows up on plain CPU-only hosts where nvenc/qsv are
+    compiled in but immediately fail to open with no GPU behind them)."""
+    candidates = {"nvenc": "h264_nvenc", "qsv": "h264_qsv", "videotoolbox": "h264_videotoolbox"}
+    result = {}
+    for key, encoder in candidates.items():
+        try:
+            r = subprocess.run(
+                [FFMPEG_BIN, "-hide_banner", "-y", "-f", "lavfi", "-i", "color=c=red:s=64x64:d=0.1",
+                 "-c:v", encoder, "-f", "null", "-"],
+                capture_output=True, text=True, timeout=10,
+            )
+            result[key] = r.returncode == 0
+        except Exception:
+            result[key] = False
+    return result
+HW_ENCODERS = _probe_hw_encoders()
+
 # ── Format config ─────────────────────────────────────────────────────────────
+# -tune animation is NOT baked in here — it only helps for genuinely flat-color
+# rendered/motion-graphics frames (Stitch, Render) and hurts real-footage paths
+# (Crop/Trim/Scale/Merge on uploaded video). See ANIMATION_TUNE_ARGS below,
+# applied explicitly only at the stitch/render call sites.
+# Audio codec/bitrate is pinned explicitly (was previously left to ffmpeg's
+# container default, which is inconsistent across builds) — harmless even on
+# paths that pass -an afterward, since -an always wins.
 FORMAT_CONFIG = {
-    "mp4":  {"ext": ".mp4",  "mime": "video/mp4",      "codec_args": ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-tune", "animation", "-movflags", "+faststart"]},
-    "mov":  {"ext": ".mov",  "mime": "video/quicktime", "codec_args": ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-tune", "animation", "-movflags", "+faststart"]},
-    "webm": {"ext": ".webm", "mime": "video/webm",      "codec_args": ["-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-auto-alt-ref", "0"]},
+    "mp4":  {"ext": ".mp4",  "mime": "video/mp4",      "codec_args": ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-c:a", "aac", "-b:a", "192k"]},
+    "mov":  {"ext": ".mov",  "mime": "video/quicktime", "codec_args": ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-c:a", "aac", "-b:a", "192k"]},
+    "webm": {"ext": ".webm", "mime": "video/webm",      "codec_args": ["-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-auto-alt-ref", "0", "-c:a", "libopus", "-b:a", "128k"]},
     "gif":  {"ext": ".gif",  "mime": "image/gif",       "codec_args": []},
 }
 VALID_FORMATS       = set(FORMAT_CONFIG.keys())
 VALID_VIDEO_FORMATS = {"mp4", "mov", "webm"}
+# Applied only where the source frames are genuinely rendered/motion-graphics
+# content (Stitch, Render) — not on arbitrary uploaded/merged footage.
+ANIMATION_TUNE_ARGS = ["-tune", "animation"]
+# x264 (mp4/mov) uses CRF 0–51; VP9 (webm) uses a wider, roughly-equivalent
+# 0–63 scale. Exposed so the frontend can size its quality slider correctly
+# per format instead of always capping at 51.
+CRF_RANGE = {"mp4": (0, 51), "mov": (0, 51), "webm": (0, 63)}
 
 # ── Audio format config ───────────────────────────────────────────────────────
 AUDIO_FORMAT_CONFIG = {
@@ -59,8 +104,15 @@ AUDIO_FORMAT_CONFIG = {
 }
 VALID_AUDIO_FORMATS = set(AUDIO_FORMAT_CONFIG.keys())
 ALLOWED_AUDIO_EXTS  = {".mp3", ".wav", ".aac", ".m4a", ".ogg", ".flac"}
-# Union used anywhere we need to resolve/serve *any* finished output (video or audio)
-ALL_OUTPUT_CONFIG = {**FORMAT_CONFIG, **AUDIO_FORMAT_CONFIG}
+
+# ── Thumbnail format config ───────────────────────────────────────────────────
+THUMBNAIL_FORMAT_CONFIG = {
+    "jpg": {"ext": ".jpg", "mime": "image/jpeg"},
+    "png": {"ext": ".png", "mime": "image/png"},
+}
+VALID_THUMBNAIL_FORMATS = set(THUMBNAIL_FORMAT_CONFIG.keys())
+# Union used anywhere we need to resolve/serve *any* finished output (video, audio, or thumbnail)
+ALL_OUTPUT_CONFIG = {**FORMAT_CONFIG, **AUDIO_FORMAT_CONFIG, **THUMBNAIL_FORMAT_CONFIG}
 
 # ── Asset store config ────────────────────────────────────────────────────────
 # ASSETS_DIR lives next to main.py (apps/api/assets/) so it is committed to the
@@ -109,18 +161,24 @@ def _mark_output(job_id: str, fmt: str, size_mb: float):
         if job_id in _job_meta:
             _job_meta[job_id].update({"has_output": True, "format": fmt, "size_mb": size_mb})
 
-# ── #7 — CPU Queue (semaphore, max 1 concurrent ffmpeg job) ───────────────────
-_ffmpeg_sem = threading.Semaphore(1)
-
-# ── Stage 1.2 — global cap on concurrent Playwright-render workers ────────────
-# Each "worker" here is one (Chromium page + its own ffmpeg encode subprocess)
-# pair used by the parallel frame-range renderer below. This is a separate
-# pool from _ffmpeg_sem (which guards short single-shot ffmpeg calls like
-# merges/segments) — unifying every CPU-bound code path into one scheduler is
-# a larger change, flagged for later. Default cap leaves 1 core free for the
-# FastAPI process itself on the 4-CPU target server; override via env var.
-MAX_GLOBAL_RENDER_WORKERS = int(os.environ.get("MAX_RENDER_WORKERS", str(max(1, (os.cpu_count() or 4) - 1))))
-_render_worker_sem = threading.Semaphore(MAX_GLOBAL_RENDER_WORKERS)
+# ── #7 — CPU Queue ──────────────────────────────────────────────────────────────
+# Two pools, sized off the same CPU budget, kept deliberately separate:
+#   _render_worker_sem — one slot per (Chromium page + its own ffmpeg encode
+#     subprocess) pair in the parallel frame-range renderer. These are held
+#     for the *entire* render (potentially minutes).
+#   _ffmpeg_sem — short, single-shot ffmpeg calls (merge, crop/trim/scale,
+#     segment, audio extract/edit/merge, gif, the render pipeline's own
+#     composite/stitch step). Held for seconds, not minutes.
+# Previously _ffmpeg_sem was hardcoded to 1, serializing every quick operation
+# in the app behind whichever one happened to start first — including being
+# blocked behind an unrelated render's stitch step. Sizing it off CPU count
+# (rather than unifying the two pools into one) fixes that throughput problem
+# without making short jobs wait behind a long-held render-worker slot.
+MAX_CPU_WORKERS    = max(1, (os.cpu_count() or 4) - 1)  # leave 1 core for FastAPI itself
+MAX_RENDER_WORKERS = int(os.environ.get("MAX_RENDER_WORKERS", str(MAX_CPU_WORKERS)))
+MAX_FFMPEG_WORKERS = int(os.environ.get("MAX_FFMPEG_WORKERS", str(max(1, MAX_CPU_WORKERS // 2))))
+_render_worker_sem = threading.Semaphore(MAX_RENDER_WORKERS)
+_ffmpeg_sem        = threading.Semaphore(MAX_FFMPEG_WORKERS)
 
 # ── #8 — Async job status store ───────────────────────────────────────────────
 _async_jobs: Dict[str, Dict[str, Any]] = {}
@@ -290,6 +348,29 @@ def probe_audio(path: Path) -> dict:
     dur = r.stdout.strip().splitlines()[0] if r.stdout.strip() else "0"
     return {"duration": dur}
 
+def has_audio_stream(path: Path) -> bool:
+    r = subprocess.run(
+        [FFPROBE_BIN, "-v", "error", "-select_streams", "a", "-show_entries", "stream=index",
+         "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True,
+    )
+    return bool(r.stdout.strip())
+
+def build_atempo_chain(speed: float) -> str:
+    """ffmpeg's atempo filter only accepts 0.5–2.0 per stage, so factors
+    outside that range need to be chained (e.g. 4x → atempo=2.0,atempo=2.0).
+    Used by the speed-change feature to keep audio pitch correct (atempo
+    changes tempo without changing pitch, unlike just resampling)."""
+    if speed <= 0: speed = 1.0
+    stages = []
+    remaining = speed
+    while remaining > 2.0:
+        stages.append(2.0); remaining /= 2.0
+    while remaining < 0.5:
+        stages.append(0.5); remaining /= 0.5
+    stages.append(remaining)
+    return ",".join(f"atempo={s:.6f}" for s in stages)
+
 def build_vf(crop_x, crop_y, crop_w, crop_h, width, height) -> str | None:
     filters = []
     if crop_w and crop_h:
@@ -327,7 +408,7 @@ def stitch_to_gif(input_pattern: str, fps: float, job_dir: Path, output: Path,
     return c2, e2
 
 def process_video_to_format(input_path, output_path, fmt, crf=18, preset="medium",
-                             trim_start=None, trim_end=None, vf=None):
+                             trim_start=None, trim_end=None, vf=None, speed=None):
     cfg  = FORMAT_CONFIG[fmt]
     args = []
     if trim_start is not None: args += ["-ss", str(trim_start)]
@@ -335,7 +416,13 @@ def process_video_to_format(input_path, output_path, fmt, crf=18, preset="medium
     if trim_end is not None: args += ["-to", str(trim_end)]
     if fmt in ("mp4", "mov"): args += ["-crf", str(crf), "-preset", preset]
     elif fmt == "webm":       args += ["-crf", str(crf), "-b:v", "0"]
-    if vf: args += ["-vf", vf]
+    full_vf = vf
+    if speed and speed != 1.0:
+        speed_vf = f"setpts=PTS/{speed}"
+        full_vf  = f"{vf},{speed_vf}" if vf else speed_vf
+        if has_audio_stream(Path(input_path)):
+            args += ["-af", build_atempo_chain(speed)]
+    if full_vf: args += ["-vf", full_vf]
     args += [str(output_path)]
     code, _, err = run_ffmpeg_queued(args)
     return code, err
@@ -354,11 +441,13 @@ def health():
     r    = subprocess.run([FFMPEG_BIN, "-version"], capture_output=True, text=True)
     line = r.stdout.splitlines()[0] if r.stdout else "unknown"
     total_mb = sum(f.stat().st_size for f in WORK_DIR.rglob("*") if f.is_file()) / 1_048_576
-    queue_busy = not _ffmpeg_sem._value  # 0 = busy, 1 = free
     return {"status": "ok", "ffmpeg": line, "ffmpeg_bin": FFMPEG_BIN,
             "active_jobs": len(list(WORK_DIR.iterdir())),
             "storage_used_mb": round(total_mb, 1),
-            "queue_busy": queue_busy,
+            "ffmpeg_workers_free": _ffmpeg_sem._value, "ffmpeg_workers_max": MAX_FFMPEG_WORKERS,
+            "render_workers_free": _render_worker_sem._value, "render_workers_max": MAX_RENDER_WORKERS,
+            "queue_busy": _ffmpeg_sem._value == 0,
+            "hw_encoders": HW_ENCODERS,
             "auto_clean_hours": AUTO_CLEAN_HOURS}
 
 # ── Storage ───────────────────────────────────────────────────────────────────
@@ -497,7 +586,7 @@ def _run_stitch(job_id: str, job_dir: Path, input_pattern: str, img_ext: str,
             if trim_start is not None: args += ["-ss", str(trim_start)]
             if trim_end   is not None: args += ["-to", str(trim_end)]
             args += cfg["codec_args"]
-            if fmt in ("mp4", "mov"): args += ["-crf", str(crf), "-preset", preset, "-g", str(int(fps * 2))]
+            if fmt in ("mp4", "mov"): args += [*ANIMATION_TUNE_ARGS, "-crf", str(crf), "-preset", preset, "-g", str(int(fps * 2))]
             elif fmt == "webm":       args += ["-crf", str(crf), "-b:v", "0"]
             if vf: args += ["-vf", vf]
             args += [str(output)]
@@ -558,7 +647,7 @@ async def stitch(
         if ts is not None: args += ["-ss", str(ts)]
         if te is not None: args += ["-to", str(te)]
         args += cfg["codec_args"]
-        if format in ("mp4", "mov"): args += ["-crf", str(crf), "-preset", preset]
+        if format in ("mp4", "mov"): args += [*ANIMATION_TUNE_ARGS, "-crf", str(crf), "-preset", preset]
         elif format == "webm":       args += ["-crf", str(crf), "-b:v", "0"]
         if vf: args += ["-vf", vf]
         args += [str(output)]
@@ -569,13 +658,14 @@ async def stitch(
 # ── #8 — Async process ────────────────────────────────────────────────────────
 def _run_process(job_id: str, job_dir: Path, input_video: Path,
                  fmt: str, crf: int, preset: str, vf: str | None,
-                 trim_start: float | None, trim_end: float | None):
+                 trim_start: float | None, trim_end: float | None,
+                 speed: float | None = None):
     _job_update(job_id, status="queued", message="Waiting in queue…", progress=5)
     output = output_path_for(job_dir, fmt)
     try:
         _job_update(job_id, status="processing", message="Processing video…", progress=15)
         code, err = process_video_to_format(input_video, output, fmt, crf, preset,
-                                             trim_start, trim_end, vf)
+                                             trim_start, trim_end, vf, speed)
         if code != 0: raise RuntimeError(friendly_ffmpeg_error(err))
         mb = round(output.stat().st_size / 1_048_576, 2)
         _mark_output(job_id, fmt, mb)
@@ -592,6 +682,7 @@ async def process_video(
     trim_start: Optional[str] = Form(None), trim_end: Optional[str] = Form(None),
     crop_x: Optional[str] = Form(None), crop_y: Optional[str] = Form(None),
     crop_w: Optional[str] = Form(None), crop_h: Optional[str] = Form(None),
+    speed: Optional[str] = Form(None),
     async_mode: bool = Form(False),
 ):
     if format not in VALID_VIDEO_FORMATS:
@@ -605,13 +696,16 @@ async def process_video(
         raise HTTPException(404, "No input video found. Use /jobs/upload-video first.")
     vf = build_vf(to_int(crop_x), to_int(crop_y), to_int(crop_w), to_int(crop_h),
                   to_int(width), to_int(height))
+    speed_f = to_float(speed)
+    if speed_f is not None and not (0.1 <= speed_f <= 10):
+        raise HTTPException(400, "Speed must be between 0.1x and 10x.")
 
     if async_mode:
         _job_init(job_id, label=f"Process → {format.upper()}")
         t = threading.Thread(
             target=_run_process,
             args=(job_id, job_dir, input_video, format, crf, preset, vf,
-                  to_float(trim_start), to_float(trim_end)),
+                  to_float(trim_start), to_float(trim_end), speed_f),
             daemon=True)
         t.start()
         return {"job_id": job_id, "status": "queued",
@@ -619,7 +713,7 @@ async def process_video(
 
     code, err = process_video_to_format(input_video, output_path_for(job_dir, format),
                                          format, crf, preset,
-                                         to_float(trim_start), to_float(trim_end), vf)
+                                         to_float(trim_start), to_float(trim_end), vf, speed_f)
     if code != 0: raise HTTPException(500, friendly_ffmpeg_error(err))
     return build_result(job_dir, job_id, format)
 
@@ -788,7 +882,8 @@ def list_jobs():
             "frame_count": fc,
             "has_output": out_fmt is not None,
             "format":     out_fmt,
-            "is_audio":   out_fmt in VALID_AUDIO_FORMATS if out_fmt else False,
+            "is_audio":     out_fmt in VALID_AUDIO_FORMATS if out_fmt else False,
+            "is_thumbnail": out_fmt in VALID_THUMBNAIL_FORMATS if out_fmt else False,
             "size_mb":    out_size,
             "async_status": async_meta.get("status"),
         })
@@ -816,6 +911,29 @@ def job_status(job_id: str):
             "message": "Output ready." if has_output else "Processing…",
             "progress": 100 if has_output else 0}
 
+
+# ── Thumbnail / poster-frame extraction ──────────────────────────────────────
+# Cheap (single-frame decode), synchronous — no job polling needed. Sources
+# from any prior job via _resolve_job_source_video (same convention as
+# extract-audio), and always writes into a *new* job so the source job's
+# own output is left untouched.
+@app.post("/jobs/{job_id}/thumbnail")
+async def extract_thumbnail(job_id: str, time: str = Form("0"), format: str = Form("jpg")):
+    if format not in VALID_THUMBNAIL_FORMATS:
+        raise HTTPException(400, f"Invalid format. Choose from: {', '.join(sorted(VALID_THUMBNAIL_FORMATS))}")
+    src = _resolve_job_source_video(job_id)
+    t = to_float(time) or 0.0
+
+    new_id, new_dir = new_job(label=f"Thumbnail @ {t:g}s", input_file=src.name)
+    output = output_path_for(new_dir, format)
+    args = ["-ss", str(t), "-i", str(src), "-frames:v", "1"]
+    if format == "jpg": args += ["-q:v", "2"]
+    args += [str(output)]
+    code, _, err = run_ffmpeg_queued(args)
+    if code != 0:
+        shutil.rmtree(new_dir, ignore_errors=True)
+        raise HTTPException(500, friendly_ffmpeg_error(err))
+    return build_result(new_dir, new_id, format)
 
 # ── Audio Tools ───────────────────────────────────────────────────────────────
 @app.post("/jobs/upload-audio")
@@ -1329,7 +1447,8 @@ def _composite_video_layers(
     total_frames: int,
     frames_band_dirs: list[Path] | None = None,
     video_node_order: list[str] | None = None,
-) -> Path:
+    direct_encode: dict | None = None,
+) -> tuple[Path, bool]:
     """
     FFmpeg Option-B: composite video-node frames onto the PNG sequence
     that Playwright captured, preserving correct z-order.
@@ -1344,12 +1463,27 @@ def _composite_video_layers(
         band[0] → video[0]'s clips → band[1] → video[1]'s clips → … → band[M]
 
     Fallback (fewer than 2 band dirs, or no video_node_order, e.g. no video
-    nodes or first-time error): returns frames_dir unchanged.
+    nodes or first-time error): returns (frames_dir, False) unchanged.
 
     Geometry:
       Each video node fills the full stage (position: absolute; inset: 0;
       width/height: 100%) using object-fit: contain.  We replicate that here
       with ffmpeg's scale + pad filters (letterbox/pillarbox to stage dims).
+
+    direct_encode (perf optimization — skips the PNG round-trip):
+      When provided ({"output": Path, "extra_args": list[str], "fmt": str,
+      "mixed_audio": Path | None}), the SAME ffmpeg invocation that builds
+      the filter_complex composite also encodes straight to the final video
+      container — no frame_%06d.png sequence is ever written or re-read.
+      Returns (output_path, True) on success. Falls back to the legacy
+      PNG-sequence behavior — i.e. (frames_dir, False) — if anything about
+      the composite isn't applicable or fails, so png_sequence export and
+      gif output (which both genuinely need frame files on disk) are
+      completely unaffected; only the mp4/mov/webm "has video nodes" path
+      is sped up.
+
+    Returns: (path, is_finished_video) — is_finished_video is True only when
+    direct_encode produced the final, already-encoded output file directly.
     """
     stage_w    = payload.get("stageWidth", 1920)
     stage_h    = payload.get("stageHeight", 1080)
@@ -1358,7 +1492,7 @@ def _composite_video_layers(
     # Need at least 2 bands (below + above a single video) and a video order
     # to know how to interleave them.
     if not frames_band_dirs or len(frames_band_dirs) < 2 or not video_node_order:
-        return frames_dir
+        return frames_dir, False
 
     # ── 1. Build slot → asset map, and slot → owning video-node map ───────────
     slot_to_asset: dict[str, dict] = {}
@@ -1420,7 +1554,7 @@ def _composite_video_layers(
         clips.append(VidClip(asset_path, from_time, to_time, tl_start, tl_end, node_id))
 
     if not clips:
-        return frames_dir  # no compositable clips — use original frames
+        return frames_dir, False  # no compositable clips — use original frames
 
     # ── 3. Build FFmpeg filter_complex ────────────────────────────────────────
     #
@@ -1512,8 +1646,39 @@ def _composite_video_layers(
     final_label = current_label
     filter_complex = ";".join(filter_parts)
 
-    # Direct composite → PNG sequence, no intermediate video encode.
+    if direct_encode is not None:
+        # ── Direct path: filter_complex composite + final encode in ONE ffmpeg
+        # call. No frame_%06d.png sequence is ever written to or read from
+        # disk — this is the I/O win over the old composite→PNGs→re-encode
+        # two-pass flow. Audio (if any) is muxed in via -map on the same call.
+        output_path = direct_encode["output"]
+        mixed_audio = direct_encode.get("mixed_audio")
+        audio_input_idx = ffmpeg_inputs.count("-i")  # index of the next -i we add
+
+        comp_args = list(ffmpeg_inputs)
+        if mixed_audio:
+            comp_args += ["-i", str(mixed_audio)]
+        comp_args += ["-filter_complex", filter_complex, "-map", f"[{final_label}]"]
+        if mixed_audio:
+            comp_args += ["-map", f"{audio_input_idx}:a",
+                          "-c:a", "aac" if direct_encode["fmt"] in ("mp4", "mov") else "libopus",
+                          "-shortest"]
+        else:
+            comp_args += ["-an"]
+        comp_args += direct_encode["extra_args"]
+        comp_args += [str(output_path)]
+
+        code, _, err = run_ffmpeg_with_progress_queued(
+            comp_args, job_id, total_frames, progress_start=74, progress_end=99)
+        if code != 0:
+            print(f"[QweenFFmpeg] Direct composite+encode failed for job {job_id}: {err}", file=_sys.stderr)
+            return frames_dir, False  # fall back to original Playwright frames
+        return output_path, True
+
+    # ── Legacy path: composite → PNG sequence, no intermediate video encode.
     # Avoids double-encode generation loss (old: MP4 CRF0 → explode → re-stitch).
+    # Kept exactly as-is for png_sequence export and gif output, both of which
+    # genuinely need frame files on disk.
     comp_args = (
         ffmpeg_inputs
         + ["-filter_complex", filter_complex, "-map", f"[{final_label}]"]
@@ -1524,9 +1689,9 @@ def _composite_video_layers(
     if code != 0:
         import sys
         print(f"[QweenFFmpeg] Video composite failed for job {job_id}: {err}", file=sys.stderr)
-        return frames_dir  # fall back to original Playwright frames
+        return frames_dir, False  # fall back to original Playwright frames
 
-    return comp_dir
+    return comp_dir, False
 
 
 def _resolve_tween_positions(tweens: list) -> dict:
@@ -1897,7 +2062,7 @@ def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
     requested_workers = int(payload.get("workers") or 1)
     job_workers = max(1, min(
         requested_workers,
-        MAX_GLOBAL_RENDER_WORKERS,
+        MAX_RENDER_WORKERS,
         total_frames,  # no point in more workers than frames
     )) if stream_simple_path else 1
 
@@ -1953,7 +2118,7 @@ def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
         seg_args = ["-f", "image2pipe", "-vcodec", "mjpeg",
                     "-framerate", str(fps), "-i", "-", *cfg["codec_args"]]
         if fmt in ("mp4", "mov"):
-            seg_args += ["-crf", str(crf), "-preset", "medium", "-g", str(int(fps * 2))]
+            seg_args += [*ANIMATION_TUNE_ARGS, "-crf", str(crf), "-preset", "medium", "-g", str(int(fps * 2))]
         elif fmt == "webm":
             seg_args += ["-crf", str(crf), "-b:v", "0"]
         seg_args += ["-an", str(seg_path)]
@@ -2172,7 +2337,7 @@ def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
         args += ["-c:v", "copy"]
         if mixed_audio:
             args += ["-map", "0:v", "-map", "1:a",
-                     "-c:a", "aac" if fmt in ("mp4", "mov") else "libvorbis",
+                     "-c:a", "aac" if fmt in ("mp4", "mov") else "libopus",
                      "-shortest"]
         else:
             args += ["-an"]
@@ -2199,12 +2364,40 @@ def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
     # clips] → … → [band N]. Each band PNG sequence has a transparent
     # background so they can be alpha-overlaid without clobbering the layers
     # below them.
+    #
+    # Audio is composited once, up front, so it can be reused either by the
+    # direct-encode path below (single ffmpeg call) or by the legacy
+    # PNG-sequence fallback (kept further down, unchanged).
+    mixed_audio   = None
+    direct_encode = None
+    if output_mode != "png_sequence" and fmt != "gif":
+        audio_tracks   = payload.get("_audio_tracks") or []
+        video_duration = payload.get("endTime", 0) or 0
+        _job_update(job_id, status="processing", message="Compositing audio layers…", progress=70)
+        mixed_audio = _composite_audio_layers(job_id, job_dir, audio_tracks, video_duration)
+
+        output = output_path_for(job_dir, fmt)
+        cfg = FORMAT_CONFIG[fmt]
+        extra_args = list(cfg["codec_args"])
+        if fmt in ("mp4", "mov"): extra_args += [*ANIMATION_TUNE_ARGS, "-crf", str(crf), "-preset", "medium", "-g", str(int(fps * 2))]
+        elif fmt == "webm":       extra_args += ["-crf", str(crf), "-b:v", "0"]
+        direct_encode = {"output": output, "extra_args": extra_args, "fmt": fmt, "mixed_audio": mixed_audio}
+
     _job_update(job_id, status="processing", message="Compositing video layers…", progress=74)
-    stitch_dir = _composite_video_layers(
+    stitch_dir, composited_to_final = _composite_video_layers(
         job_id, job_dir, frames_dir, payload, fps, total_frames,
         frames_band_dirs=frames_band_dirs if has_video_nodes else None,
         video_node_order=video_node_ids if has_video_nodes else None,
+        direct_encode=direct_encode,
     )
+
+    if composited_to_final:
+        # _composite_video_layers already wrote the final, fully-encoded
+        # output directly — no separate stitch pass needed.
+        mb = round(stitch_dir.stat().st_size / 1_048_576, 2)
+        _mark_output(job_id, fmt, mb)
+        _job_update(job_id, status="done", message=f"Done — {mb} MB", progress=100, size_mb=mb, format=fmt)
+        return
 
     if output_mode == "png_sequence":
         # ── PNG Sequence export: zip stitch_dir and store as output.zip ────────
@@ -2228,6 +2421,10 @@ def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
         return
 
     # ── Video output (default) ─────────────────────────────────────────────────
+    # Reached only when composited_to_final was False above — i.e. gif output
+    # (which needs frame files for its two-pass palette flow), or a fallback
+    # after a failed/inapplicable direct-encode composite. mixed_audio (if
+    # relevant) was already composited once, up front — not recomputed here.
     _job_update(job_id, status="processing", message="Stitching frames…", progress=84)
 
     output = output_path_for(job_dir, fmt)
@@ -2236,25 +2433,18 @@ def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
     if fmt == "gif":
         code, err = stitch_to_gif(input_pattern, fps, job_dir, output)
     else:
-        # ── Audio: composite audio layers into a single mixed WAV ──────────────
-        audio_tracks   = payload.get("_audio_tracks") or []
-        video_duration = payload.get("endTime", 0) or 0
-
-        _job_update(job_id, status="processing", message="Compositing audio layers…", progress=85)
-        mixed_audio = _composite_audio_layers(job_id, job_dir, audio_tracks, video_duration)
-
         # ── Stitch frames → video, mux mixed audio if present ─────────────────
         args = ["-framerate", str(fps), "-i", input_pattern]
         if mixed_audio:
             args += ["-i", str(mixed_audio)]
         args += cfg["codec_args"]
         if fmt in ("mp4", "mov"):
-            args += ["-crf", str(crf), "-preset", "medium", "-g", str(int(fps * 2))]
+            args += [*ANIMATION_TUNE_ARGS, "-crf", str(crf), "-preset", "medium", "-g", str(int(fps * 2))]
         elif fmt == "webm":
             args += ["-crf", str(crf), "-b:v", "0"]
         if mixed_audio:
             args += ["-map", "0:v", "-map", "1:a",
-                     "-c:a", "aac" if fmt in ("mp4", "mov") else "libvorbis",
+                     "-c:a", "aac" if fmt in ("mp4", "mov") else "libopus",
                      "-shortest"]
         else:
             args += ["-an"]

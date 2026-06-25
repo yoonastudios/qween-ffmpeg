@@ -2,7 +2,7 @@
 import { useState, useRef } from 'react'
 import { DropZone, Btn, Card, Field, NumInput, PillGroup, SectionTitle,
          LogBox, ErrorBox, ResultPreview, UploadProgress } from '@/components/ui'
-import { renderProject, VIDEO_FORMATS } from '@/lib/api'
+import { renderProject, VIDEO_FORMATS, CRF_RANGE } from '@/lib/api'
 import type { VideoFormat } from '@/lib/api'
 
 const FPS_OPTIONS = [12, 24, 25, 30, 48, 60]
@@ -126,7 +126,7 @@ export default function RenderTool({ apiBase, onChainTo }: {
           <Field label={`Quality — CRF ${crf}`} hint={crf <= 18 ? '✦ visually lossless' : crf <= 28 ? '✦ good' : '⚠ lossy'}>
             <div className="flex items-center gap-3">
               <span className="text-xs font-mono text-green">best</span>
-              <input type="range" min={0} max={51} value={crf} disabled={!canEdit}
+              <input type="range" min={0} max={CRF_RANGE[format]?.[1] ?? 51} value={crf} disabled={!canEdit}
                 onChange={e => setCrf(Number(e.target.value))} />
               <span className="text-xs font-mono text-red">worst</span>
             </div>
