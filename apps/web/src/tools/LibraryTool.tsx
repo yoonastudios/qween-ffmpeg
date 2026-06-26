@@ -1,8 +1,8 @@
 'use client'
 import { useState, useEffect, useCallback } from 'react'
-import { Card, SectionTitle, Btn, DownloadBtn, ErrorBox, PillGroup } from '@/components/ui'
+import { Card, SectionTitle, Btn, Field, NumInput, DownloadBtn, ErrorBox, PillGroup } from '@/components/ui'
 import { listJobs, mergeExisting, getJobStatus, downloadUrl, extractThumbnail, FORMAT_LABELS, VIDEO_FORMATS } from '@/lib/api'
-import type { JobRecord, VideoFormat } from '@/lib/api'
+import type { JobRecord, VideoFormat, ThumbnailFormat } from '@/lib/api'
 
 function timeAgo(ts: number): string {
   const diff = Math.floor((Date.now() / 1000) - ts)
@@ -25,17 +25,29 @@ export default function LibraryTool({ apiBase }: { apiBase: string }) {
   const [progress, setProgress] = useState(0)
   const [message, setMessage] = useState('')
   const [resultMb, setResultMb] = useState<number | null>(null)
-  const [thumbnailingId, setThumbnailingId] = useState<string | null>(null)
 
-  const handleThumbnail = async (e: React.MouseEvent, job: JobRecord) => {
+  // ── Thumbnail panel (per-row) ────────────────────────────────────────────────
+  const [thumbOpenId, setThumbOpenId]   = useState<string | null>(null)
+  const [thumbTime, setThumbTime]       = useState('0')
+  const [thumbFormat, setThumbFormat]   = useState<ThumbnailFormat>('jpg')
+  const [thumbBusy, setThumbBusy]       = useState(false)
+  const [thumbError, setThumbError]     = useState('')
+  const [thumbResult, setThumbResult]   = useState<{ jobId: string; previewJobId: string } | null>(null)
+
+  const openThumbPanel = (e: React.MouseEvent, job: JobRecord) => {
     e.stopPropagation()
-    if (thumbnailingId) return
-    setThumbnailingId(job.job_id); setError('')
+    if (thumbOpenId === job.job_id) { setThumbOpenId(null); return }
+    setThumbOpenId(job.job_id); setThumbTime('0'); setThumbFormat('jpg')
+    setThumbResult(null); setThumbError('')
+  }
+
+  const handleGrabThumbnail = async (job: JobRecord) => {
+    setThumbBusy(true); setThumbError(''); setThumbResult(null)
     try {
-      const r = await extractThumbnail(job.job_id, 0, 'jpg', apiBase)
-      window.open(downloadUrl(r.job_id, apiBase), '_blank')
-    } catch (err: any) { setError(err.message) }
-    finally { setThumbnailingId(null) }
+      const r = await extractThumbnail(job.job_id, Number(thumbTime || 0), thumbFormat, apiBase)
+      setThumbResult({ jobId: job.job_id, previewJobId: r.job_id })
+    } catch (err: any) { setThumbError(err.message) }
+    finally { setThumbBusy(false) }
   }
 
   const fetchJobs = useCallback(async () => {
@@ -134,43 +146,69 @@ export default function LibraryTool({ apiBase }: { apiBase: string }) {
 
       <div className="flex flex-col gap-2">
         {jobs.map(job => {
-          const isSelected = selected.includes(job.job_id)
+          const isSelected   = selected.includes(job.job_id)
+          const isThumbOpen  = thumbOpenId === job.job_id
           return (
-            <div key={job.job_id}
-              className={`bg-panel border rounded-2xl p-3 flex items-center gap-3 cursor-pointer transition-colors
-                ${isSelected ? 'border-accent/60' : 'border-border'}`}
-              onClick={() => toggle(job.job_id)}>
-              <div className={`w-5 h-5 rounded-lg border flex items-center justify-center shrink-0
-                ${isSelected ? 'bg-accent border-accent' : 'border-border bg-bg'}`}>
-                {isSelected && (
-                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="3">
-                    <polyline points="20 6 9 17 4 12"/>
-                  </svg>
-                )}
-              </div>
-              <div className="flex-1 min-w-0">
-                <p className="text-xs font-mono text-text truncate">{jobLabel(job)}</p>
-                <p className="text-[10px] font-mono text-muted mt-0.5">
-                  {job.job_id.slice(0, 8)} · {timeAgo(job.created_at)}
-                </p>
-              </div>
-              <div className="flex items-center gap-2 shrink-0 text-[10px] font-mono text-muted">
-                {job.format && <span className="text-accent">{FORMAT_LABELS[job.format] ?? job.format.toUpperCase()}</span>}
-                {job.size_mb && <span>{job.size_mb} MB</span>}
-                <button onClick={e => handleThumbnail(e, job)} disabled={thumbnailingId === job.job_id}
-                  title="Grab thumbnail"
-                  className="w-7 h-7 rounded-md bg-bg border border-border text-muted hover:border-accent/40 hover:text-accent
-                    disabled:opacity-40 flex items-center justify-center active:scale-90 transition-colors">
-                  {thumbnailingId === job.job_id ? (
-                    <span className="w-3 h-3 border-2 border-current border-t-transparent rounded-full animate-spin" />
-                  ) : (
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <div key={job.job_id} className="flex flex-col gap-2">
+              <div
+                className={`bg-panel border rounded-2xl p-3 flex items-center gap-3 cursor-pointer transition-colors
+                  ${isSelected ? 'border-accent/60' : 'border-border'}`}
+                onClick={() => toggle(job.job_id)}>
+                <div className={`w-5 h-5 rounded-lg border flex items-center justify-center shrink-0
+                  ${isSelected ? 'bg-accent border-accent' : 'border-border bg-bg'}`}>
+                  {isSelected && (
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="3">
+                      <polyline points="20 6 9 17 4 12"/>
+                    </svg>
+                  )}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className="text-xs font-mono text-text truncate">{jobLabel(job)}</p>
+                  <p className="text-[10px] font-mono text-muted mt-0.5">
+                    {job.job_id.slice(0, 8)} · {timeAgo(job.created_at)}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2 shrink-0 text-[10px] font-mono text-muted">
+                  {job.format && <span className="text-accent">{FORMAT_LABELS[job.format] ?? job.format.toUpperCase()}</span>}
+                  {job.size_mb && <span>{job.size_mb} MB</span>}
+                  <button onClick={e => openThumbPanel(e, job)}
+                    title="Grab a thumbnail at a chosen time"
+                    className={`flex items-center gap-1.5 h-7 px-2.5 rounded-md border text-[10px] font-mono font-bold transition-colors active:scale-95
+                      ${isThumbOpen ? 'bg-accent border-accent text-white' : 'bg-bg border-border text-muted hover:border-accent/40 hover:text-accent'}`}>
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                       <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
                       <circle cx="12" cy="13" r="4"/>
                     </svg>
-                  )}
-                </button>
+                    Thumbnail
+                  </button>
+                </div>
               </div>
+
+              {isThumbOpen && (
+                <div className="bg-panel border border-border rounded-2xl p-4 flex flex-col gap-3" onClick={e => e.stopPropagation()}>
+                  <SectionTitle>Grab Frame</SectionTitle>
+                  <div className="grid grid-cols-2 gap-3">
+                    <Field label="Time (seconds into the video)">
+                      <NumInput value={thumbTime} onChange={setThumbTime} placeholder="0" min={0} step={0.1} />
+                    </Field>
+                    <Field label="Format">
+                      <PillGroup options={['jpg', 'png']} value={thumbFormat} onChange={v => setThumbFormat(v as ThumbnailFormat)} />
+                    </Field>
+                  </div>
+                  <Btn onClick={() => handleGrabThumbnail(job)} disabled={thumbBusy} fullWidth>
+                    {thumbBusy ? 'Grabbing…' : `📷 Grab Frame @ ${thumbTime || 0}s`}
+                  </Btn>
+                  <ErrorBox message={thumbError} />
+                  {thumbResult?.jobId === job.job_id && (
+                    <div className="flex flex-col gap-2">
+                      <img src={downloadUrl(thumbResult.previewJobId, apiBase)} alt="Thumbnail preview"
+                        className="w-full rounded-xl border border-border" />
+                      <DownloadBtn href={downloadUrl(thumbResult.previewJobId, apiBase)}
+                        label={`Download ${thumbFormat.toUpperCase()}`} />
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           )
         })}
