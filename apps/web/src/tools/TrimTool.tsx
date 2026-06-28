@@ -1,8 +1,9 @@
 'use client'
 import { useState, useRef, useEffect } from 'react'
-import { DropZone, Btn, Card, Field, NumInput, SectionTitle,
+import { DropZone, Btn, Card, SectionTitle,
          LogBox, ErrorBox, ResultPreview, PillGroup, UploadProgress } from '@/components/ui'
-import { uploadVideo, VIDEO_FORMATS } from '@/lib/api'
+import { TrimScrubber } from '@/components/ui/VideoEditors'
+import { uploadVideo, downloadUrl, extractFilmstrip, VIDEO_FORMATS } from '@/lib/api'
 import type { VideoFormat, VideoUploadResult } from '@/lib/api'
 
 type Stage = 'idle' | 'uploading' | 'ready' | 'queued' | 'processing' | 'done' | 'error'
@@ -14,8 +15,9 @@ export default function TrimTool({ apiBase, initialUpload, onChainConsumed, onCh
   onChainTo?: (jobId: string, toolId: string) => void
 }) {
   const [file, setFile]       = useState<File | null>(null)
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null)
   const [stage, setStage]     = useState<Stage>('idle')
-  const [upload, setUpload]   = useState<any>(null)
+  const [upload, setUpload]   = useState<VideoUploadResult | null>(null)
   const [jobId, setJobId]     = useState<string | null>(null)
   const [log, setLog]         = useState<string[]>([])
   const [error, setError]     = useState('')
@@ -25,19 +27,38 @@ export default function TrimTool({ apiBase, initialUpload, onChainConsumed, onCh
   const [resultMb, setResultMb]   = useState<number | null>(null)
   const [resultFmt, setResultFmt] = useState('')
   const [format, setFormat]   = useState<VideoFormat>('mp4')
-    const [trimStart, setTrimStart] = useState("")
-  const [trimEnd, setTrimEnd] = useState("")
+  const [trimStart, setTrimStart] = useState(0)
+  const [trimEnd, setTrimEnd]     = useState(0)
+  const [filmstripUrl, setFilmstripUrl] = useState<string | null>(null)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const addLog = (m: string) => setLog(p => [...p, m])
+
+  useEffect(() => {
+    if (!file) return
+    const url = URL.createObjectURL(file)
+    setPreviewUrl(url)
+    return () => URL.revokeObjectURL(url)
+  }, [file])
+
+  const loadFilmstrip = async (jid: string) => {
+    setFilmstripUrl(null)
+    try {
+      const r = await extractFilmstrip(jid, 12, 140, apiBase)
+      setFilmstripUrl(downloadUrl(r.job_id, apiBase))
+    } catch { /* non-critical — scrubber falls back to a plain track */ }
+  }
 
   // Stage 2.1: a previous tool's output was sent here via "Send to Trim" —
   // skip the upload step and start straight from 'ready'.
   useEffect(() => {
     if (!initialUpload) return
     setUpload(initialUpload)
+    setTrimStart(0); setTrimEnd(Number(initialUpload.duration))
+    setPreviewUrl(downloadUrl(initialUpload.job_id, apiBase))
     addLog(`✓ Received from previous step · ${initialUpload.width}×${initialUpload.height} · ${Number(initialUpload.duration).toFixed(1)}s`)
     setStage('ready')
+    loadFilmstrip(initialUpload.job_id)
     onChainConsumed?.()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialUpload])
@@ -69,9 +90,10 @@ export default function TrimTool({ apiBase, initialUpload, onChainConsumed, onCh
     try {
       const r = await uploadVideo(f, apiBase, setUploadPct)
       setUpload(r)
-      
+      setTrimStart(0); setTrimEnd(Number(r.duration))
       addLog(`✓ ${r.width}×${r.height} · ${Number(r.duration).toFixed(1)}s`)
       setStage('ready')
+      loadFilmstrip(r.job_id)
     } catch (e: any) { setError(e.message); setStage('idle') }
   }
 
@@ -81,10 +103,11 @@ export default function TrimTool({ apiBase, initialUpload, onChainConsumed, onCh
     addLog(`Processing → ${format.toUpperCase()}…`)
     try {
       const fd = new FormData()
-              const params: Record<string, string> = { format, async_mode: "true" }
-        if (trimStart) params.trim_start = trimStart
-        if (trimEnd)   params.trim_end   = trimEnd
-      Object.entries(params).forEach(([k,v]) => fd.append(k, v))
+      const params: Record<string, string> = {
+        format, async_mode: 'true',
+        trim_start: String(trimStart), trim_end: String(trimEnd),
+      }
+      Object.entries(params).forEach(([k, v]) => fd.append(k, v))
       const r = await fetch(`${apiBase}/jobs/${upload.job_id}/process`, { method: 'POST', body: fd })
       const d = await r.json()
       if (!r.ok) throw new Error(d.detail ?? 'Process failed')
@@ -98,14 +121,14 @@ export default function TrimTool({ apiBase, initialUpload, onChainConsumed, onCh
     if (pollRef.current) clearInterval(pollRef.current)
     setFile(null); setUpload(null); setJobId(null); setLog([]); setError('')
     setStage('idle'); setProgress(0); setMessage(''); setResultMb(null)
-    setTrimStart(""); setTrimEnd("")
+    setTrimStart(0); setTrimEnd(0); setFilmstripUrl(null)
   }
 
   const isWorking = stage === 'queued' || stage === 'processing'
 
   return (
     <div className="flex flex-col gap-4 pb-6">
-      <DropZone onFile={handleFile} loading={stage==='uploading'} file={file}
+      <DropZone onFile={handleFile} loading={stage === 'uploading'} file={file}
         accept=".mp4,.mov,.webm,.avi,.mkv"
         label="Drop a video file to trim"
         sub="MP4 · MOV · WebM · AVI · MKV" />
@@ -117,35 +140,19 @@ export default function TrimTool({ apiBase, initialUpload, onChainConsumed, onCh
         </Card>
       )}
 
-      {upload && stage !== 'uploading' && (
-        <Card className="px-4 py-3 flex items-center gap-3">
-          <div className="w-8 h-8 rounded-lg bg-accent/10 border border-accent/20 flex items-center justify-center flex-shrink-0">
-            <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="#7c6dfa" strokeWidth="2">
-              <rect x="2" y="3" width="20" height="14" rx="2"/>
-              <line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>
-            </svg>
-          </div>
-          <div className="text-xs font-mono">
-            <span className="text-text">{upload.width}×{upload.height}</span>
-            <span className="text-muted ml-2">{Number(upload.duration).toFixed(1)}s</span>
-            <span className="text-muted ml-2">{upload.size_mb} MB</span>
-          </div>
-        </Card>
-      )}
-
-      {(stage === 'ready' || isWorking || stage === 'done' || stage === 'error') && (
+      {(stage === 'ready' || isWorking || stage === 'done' || stage === 'error') && upload && previewUrl && (
         <Card className="p-4 flex flex-col gap-5">
+          <div>
+            <SectionTitle>Drag handles to trim</SectionTitle>
+            <TrimScrubber
+              src={previewUrl} duration={Number(upload.duration)} filmstripUrl={filmstripUrl}
+              start={trimStart} end={trimEnd}
+              onChange={(s, e) => { setTrimStart(s); setTrimEnd(e) }}
+            />
+          </div>
           <div>
             <SectionTitle>Output Format</SectionTitle>
             <PillGroup options={VIDEO_FORMATS} value={format} onChange={v => setFormat(v as VideoFormat)} />
-          </div>
-                    <div>
-            <SectionTitle>Trim Range (seconds)</SectionTitle>
-            <div className="grid grid-cols-2 gap-3">
-              <Field label="Start" hint="Default: 0s"><NumInput value={trimStart} onChange={setTrimStart} placeholder="0" min={0} step={0.1} /></Field>
-              <Field label="End" hint={`Default: ${upload ? Number(upload.duration).toFixed(1) : "—"}s`}><NumInput value={trimEnd} onChange={setTrimEnd} placeholder={upload ? Number(upload.duration).toFixed(1) : "—"} min={0} step={0.1} /></Field>
-            </div>
-            {upload && <p className="text-[11px] text-muted font-mono mt-3">Full: {Number(upload.duration).toFixed(1)}s · Trimmed: {trimStart||0}s → {trimEnd||Number(upload.duration).toFixed(1)}s</p>}
           </div>
         </Card>
       )}
@@ -153,7 +160,7 @@ export default function TrimTool({ apiBase, initialUpload, onChainConsumed, onCh
       {isWorking && (
         <Card className="p-4 flex flex-col gap-3">
           <div className="flex items-center justify-between text-xs font-mono">
-            <span className="text-sub">{message || (stage==='queued' ? 'Waiting in queue…' : 'Processing…')}</span>
+            <span className="text-sub">{message || (stage === 'queued' ? 'Waiting in queue…' : 'Processing…')}</span>
             <span className="text-accent">{progress}%</span>
           </div>
           <div className="h-1.5 bg-bg border border-border rounded-full overflow-hidden">

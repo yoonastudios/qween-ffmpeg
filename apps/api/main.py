@@ -912,6 +912,33 @@ def job_status(job_id: str):
             "progress": 100 if has_output else 0}
 
 
+# ── Filmstrip sprite — for the Trim tool's visual timeline scrubber ─────────
+# One ffmpeg pass: resample to exactly `count` frames evenly spaced across the
+# video's duration (fps=count/duration), scale each down, then tile them
+# left-to-right into a single sprite image. The frontend just stretches this
+# as a background-image across the scrubber track — no slicing needed since
+# frame order already matches left-to-right time order.
+@app.post("/jobs/{job_id}/filmstrip")
+async def extract_filmstrip(job_id: str, count: int = Form(10), width: int = Form(160)):
+    if not (2 <= count <= 60):
+        raise HTTPException(400, "count must be between 2 and 60.")
+    src = _resolve_job_source_video(job_id)
+    info = probe_video(src)
+    duration = to_float(info["duration"]) or 1.0
+    fps = count / max(duration, 0.1)
+
+    new_id, new_dir = new_job(label=f"Filmstrip ×{count}", input_file=src.name)
+    output = output_path_for(new_dir, "jpg")
+    args = ["-i", str(src), "-vf", f"fps={fps},scale={width}:-1,tile={count}x1",
+            "-frames:v", "1", "-q:v", "4", str(output)]
+    code, _, err = run_ffmpeg_queued(args)
+    if code != 0:
+        shutil.rmtree(new_dir, ignore_errors=True)
+        raise HTTPException(500, friendly_ffmpeg_error(err))
+    result = build_result(new_dir, new_id, "jpg")
+    result["count"] = count
+    return result
+
 # ── Thumbnail / poster-frame extraction ──────────────────────────────────────
 # Cheap (single-frame decode), synchronous — no job polling needed. Sources
 # from any prior job via _resolve_job_source_video (same convention as

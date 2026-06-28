@@ -1,8 +1,10 @@
 'use client'
 import { useState, useRef, useEffect } from 'react'
-import { DropZone, Btn, Card, Field, NumInput, SectionTitle,
+import { DropZone, Btn, Card, SectionTitle,
          LogBox, ErrorBox, ResultPreview, PillGroup, UploadProgress } from '@/components/ui'
-import { uploadVideo, VIDEO_FORMATS } from '@/lib/api'
+import { CropOverlay } from '@/components/ui/VideoEditors'
+import type { CropRect } from '@/components/ui/VideoEditors'
+import { uploadVideo, downloadUrl, VIDEO_FORMATS } from '@/lib/api'
 import type { VideoFormat, VideoUploadResult } from '@/lib/api'
 
 type Stage = 'idle' | 'uploading' | 'ready' | 'queued' | 'processing' | 'done' | 'error'
@@ -14,8 +16,9 @@ export default function CropTool({ apiBase, initialUpload, onChainConsumed, onCh
   onChainTo?: (jobId: string, toolId: string) => void
 }) {
   const [file, setFile]       = useState<File | null>(null)
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null)
   const [stage, setStage]     = useState<Stage>('idle')
-  const [upload, setUpload]   = useState<any>(null)
+  const [upload, setUpload]   = useState<VideoUploadResult | null>(null)
   const [jobId, setJobId]     = useState<string | null>(null)
   const [log, setLog]         = useState<string[]>([])
   const [error, setError]     = useState('')
@@ -25,20 +28,28 @@ export default function CropTool({ apiBase, initialUpload, onChainConsumed, onCh
   const [resultMb, setResultMb]   = useState<number | null>(null)
   const [resultFmt, setResultFmt] = useState('')
   const [format, setFormat]   = useState<VideoFormat>('mp4')
-    const [cropX, setCropX] = useState("")
-  const [cropY, setCropY] = useState("")
-  const [cropW, setCropW] = useState("")
-  const [cropH, setCropH] = useState("")
+  const [crop, setCrop]       = useState<CropRect | null>(null)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const addLog = (m: string) => setLog(p => [...p, m])
 
+  // Local file → instant preview, no upload round-trip needed just to see the
+  // frame. Revoke on change/unmount to avoid leaking blob URLs.
+  useEffect(() => {
+    if (!file) return
+    const url = URL.createObjectURL(file)
+    setPreviewUrl(url)
+    return () => URL.revokeObjectURL(url)
+  }, [file])
+
   // Stage 2.1: a previous tool's output was sent here via "Send to Crop" —
-  // skip the upload step and start straight from 'ready'.
+  // skip the upload step and start straight from 'ready'. No local File in
+  // this case, so preview from the already-uploaded job's own video instead.
   useEffect(() => {
     if (!initialUpload) return
     setUpload(initialUpload)
-    setCropW(initialUpload.width); setCropH(initialUpload.height)
+    setCrop({ x: 0, y: 0, w: Number(initialUpload.width), h: Number(initialUpload.height) })
+    setPreviewUrl(downloadUrl(initialUpload.job_id, apiBase))
     addLog(`✓ Received from previous step · ${initialUpload.width}×${initialUpload.height} · ${Number(initialUpload.duration).toFixed(1)}s`)
     setStage('ready')
     onChainConsumed?.()
@@ -72,21 +83,23 @@ export default function CropTool({ apiBase, initialUpload, onChainConsumed, onCh
     try {
       const r = await uploadVideo(f, apiBase, setUploadPct)
       setUpload(r)
-            setCropW(r.width); setCropH(r.height)
+      setCrop({ x: 0, y: 0, w: Number(r.width), h: Number(r.height) })
       addLog(`✓ ${r.width}×${r.height} · ${Number(r.duration).toFixed(1)}s`)
       setStage('ready')
     } catch (e: any) { setError(e.message); setStage('idle') }
   }
 
   const handleRun = async () => {
-    if (!upload) return
+    if (!upload || !crop) return
     setStage('queued'); setError(''); setProgress(0); setMessage('Queuing…')
     addLog(`Processing → ${format.toUpperCase()}…`)
     try {
       const fd = new FormData()
-              const params: Record<string, string> = { format, async_mode: "true" }
-        if (cropW && cropH) { params.crop_w = cropW; params.crop_h = cropH; params.crop_x = cropX||"0"; params.crop_y = cropY||"0" }
-      Object.entries(params).forEach(([k,v]) => fd.append(k, v))
+      const params: Record<string, string> = {
+        format, async_mode: 'true',
+        crop_x: String(crop.x), crop_y: String(crop.y), crop_w: String(crop.w), crop_h: String(crop.h),
+      }
+      Object.entries(params).forEach(([k, v]) => fd.append(k, v))
       const r = await fetch(`${apiBase}/jobs/${upload.job_id}/process`, { method: 'POST', body: fd })
       const d = await r.json()
       if (!r.ok) throw new Error(d.detail ?? 'Process failed')
@@ -99,15 +112,14 @@ export default function CropTool({ apiBase, initialUpload, onChainConsumed, onCh
   const reset = () => {
     if (pollRef.current) clearInterval(pollRef.current)
     setFile(null); setUpload(null); setJobId(null); setLog([]); setError('')
-    setStage('idle'); setProgress(0); setMessage(''); setResultMb(null)
-    setCropX(""); setCropY(""); setCropW(""); setCropH("")
+    setStage('idle'); setProgress(0); setMessage(''); setResultMb(null); setCrop(null)
   }
 
   const isWorking = stage === 'queued' || stage === 'processing'
 
   return (
     <div className="flex flex-col gap-4 pb-6">
-      <DropZone onFile={handleFile} loading={stage==='uploading'} file={file}
+      <DropZone onFile={handleFile} loading={stage === 'uploading'} file={file}
         accept=".mp4,.mov,.webm,.avi,.mkv"
         label="Drop a video file to crop"
         sub="MP4 · MOV · WebM · AVI · MKV" />
@@ -119,37 +131,22 @@ export default function CropTool({ apiBase, initialUpload, onChainConsumed, onCh
         </Card>
       )}
 
-      {upload && stage !== 'uploading' && (
-        <Card className="px-4 py-3 flex items-center gap-3">
-          <div className="w-8 h-8 rounded-lg bg-accent/10 border border-accent/20 flex items-center justify-center flex-shrink-0">
-            <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="#7c6dfa" strokeWidth="2">
-              <rect x="2" y="3" width="20" height="14" rx="2"/>
-              <line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>
-            </svg>
-          </div>
-          <div className="text-xs font-mono">
-            <span className="text-text">{upload.width}×{upload.height}</span>
-            <span className="text-muted ml-2">{Number(upload.duration).toFixed(1)}s</span>
-            <span className="text-muted ml-2">{upload.size_mb} MB</span>
-          </div>
-        </Card>
-      )}
-
-      {(stage === 'ready' || isWorking || stage === 'done' || stage === 'error') && (
+      {(stage === 'ready' || isWorking || stage === 'done' || stage === 'error') && upload && crop && previewUrl && (
         <Card className="p-4 flex flex-col gap-5">
+          <div>
+            <SectionTitle>Drag to crop</SectionTitle>
+            <CropOverlay
+              src={previewUrl}
+              naturalWidth={Number(upload.width)} naturalHeight={Number(upload.height)}
+              value={crop} onChange={setCrop}
+            />
+            <p className="text-[11px] text-muted font-mono mt-3">
+              Source: {upload.width}×{upload.height} · Crop: {crop.w}×{crop.h} @ ({crop.x},{crop.y})
+            </p>
+          </div>
           <div>
             <SectionTitle>Output Format</SectionTitle>
             <PillGroup options={VIDEO_FORMATS} value={format} onChange={v => setFormat(v as VideoFormat)} />
-          </div>
-                    <div>
-            <SectionTitle>Crop Region</SectionTitle>
-            <div className="grid grid-cols-2 gap-3">
-              <Field label="X Offset (px)"><NumInput value={cropX} onChange={setCropX} placeholder="0" min={0} /></Field>
-              <Field label="Y Offset (px)"><NumInput value={cropY} onChange={setCropY} placeholder="0" min={0} /></Field>
-              <Field label="Width (px)"><NumInput value={cropW} onChange={setCropW} placeholder={upload?.width} min={1} /></Field>
-              <Field label="Height (px)"><NumInput value={cropH} onChange={setCropH} placeholder={upload?.height} min={1} /></Field>
-            </div>
-            {upload && <p className="text-[11px] text-muted font-mono mt-3">Source: {upload.width}×{upload.height} · Crop: {cropW||upload.width}×{cropH||upload.height} @ ({cropX||0},{cropY||0})</p>}
           </div>
         </Card>
       )}
@@ -157,7 +154,7 @@ export default function CropTool({ apiBase, initialUpload, onChainConsumed, onCh
       {isWorking && (
         <Card className="p-4 flex flex-col gap-3">
           <div className="flex items-center justify-between text-xs font-mono">
-            <span className="text-sub">{message || (stage==='queued' ? 'Waiting in queue…' : 'Processing…')}</span>
+            <span className="text-sub">{message || (stage === 'queued' ? 'Waiting in queue…' : 'Processing…')}</span>
             <span className="text-accent">{progress}%</span>
           </div>
           <div className="h-1.5 bg-bg border border-border rounded-full overflow-hidden">

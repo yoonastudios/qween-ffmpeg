@@ -292,9 +292,18 @@ export const audioDownloadUrl = (jobId: string, base = DEFAULT_BASE) => `${base}
 
 // ── Thumbnail / poster-frame extraction ───────────────────────────────────────
 export type ThumbnailFormat = 'jpg' | 'png'
+export interface ThumbnailResult extends ProcessResult { count?: number }
 export async function extractThumbnail(
   jobId: string, time: number, format: ThumbnailFormat = 'jpg', base = DEFAULT_BASE,
 ): Promise<ProcessResult> {
   const fd = new FormData(); fd.append('time', String(time)); fd.append('format', format)
   return apiFetch(`${base}/jobs/${jobId}/thumbnail`, { method: 'POST', body: fd }, 'Thumbnail extraction failed')
+}
+
+// ── Filmstrip sprite — for the Trim tool's visual timeline scrubber ──────────
+export async function extractFilmstrip(
+  jobId: string, count = 10, width = 160, base = DEFAULT_BASE,
+): Promise<ThumbnailResult> {
+  const fd = new FormData(); fd.append('count', String(count)); fd.append('width', String(width))
+  return apiFetch(`${base}/jobs/${jobId}/filmstrip`, { method: 'POST', body: fd }, 'Filmstrip extraction failed')
 }
